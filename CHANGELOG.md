@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.1
+
+- Installer: fixed the error at the end of installing ("The given path's format is not
+  supported"). The mod itself was installed, but the example config was not copied and the
+  next steps were not shown.
+
 ## v0.3.0
 
 - Multiplayer support (experimental): in multiplayer battles each player's copy only commands

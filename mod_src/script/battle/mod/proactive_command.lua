@@ -17,7 +17,7 @@
 --   proactive_command_log.txt
 --------------------------------------------------------------------------------
 
-local VERSION = "0.3.0"
+local VERSION = "0.3.1"
 
 if proactive_command_loaded then return end
 

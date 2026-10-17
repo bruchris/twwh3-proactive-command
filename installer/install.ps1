@@ -134,8 +134,8 @@ $new = Get-PackVersion $Source
 Copy-Item -LiteralPath $Source -Destination $Target -Force
 $thumb = Join-Path $Here $ThumbName
 if (Test-Path -LiteralPath $thumb) { Copy-Item -LiteralPath $thumb -Destination (Join-Path $Data $ThumbName) -Force }
-$example = Join-Path $Here $Example
-if (Test-Path -LiteralPath $example) { Copy-Item -LiteralPath $example -Destination (Join-Path $GamePath $Example) -Force }
+$exampleSrc = Join-Path $Here $Example
+if (Test-Path -LiteralPath $exampleSrc) { Copy-Item -LiteralPath $exampleSrc -Destination (Join-Path $GamePath $Example) -Force }
 
 if (-not $old)            { Say "Installed Proactive Command v$new." 'Green' }
 elseif ($old -eq $new)    { Say "Reinstalled Proactive Command v$new (it was already up to date)." 'Green' }
