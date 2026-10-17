@@ -1,0 +1,12 @@
+# build output
+dist/
+/proactive_command.pack
+
+# python
+__pycache__/
+*.pyc
+
+# local game files that never belong in the repo
+proactive_command_config.lua
+proactive_command_log.txt
+extract/
