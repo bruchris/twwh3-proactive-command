@@ -25,6 +25,8 @@ return {
     auto_engage = true,
     engage_min_score = 0.35,              -- higher = more cautious
     engage_radius = { infantry = 110, anti_large = 110, cavalry = 180, monster = 140, character = 130, missile = 0 },
+    engage_unlimited = true,              -- after first contact, healthy units look for targets anywhere
+    engage_unlimited_from_start = false,  -- true = also right after deployment (the army marches off)
     engage_characters = true,             -- melee lords/heroes join fights
     engage_casters = false,               -- spellcasters keep their distance
     player_order_grace = 8,               -- seconds after your order before a unit acts on its own
@@ -47,4 +49,6 @@ return {
     -- Development only: run a loose copy of the script instead of the packed one, so edits
     -- take effect at the next battle (re)start. Use forward slashes.
     -- dev_script_path = "C:/path/to/mod_src/script/battle/mod/proactive_command.lua",
+    -- Diagnosis: try one kind of game call per second at battle start (see docs/DEVELOPMENT.md)
+    -- debug_bisect = 33,
 }

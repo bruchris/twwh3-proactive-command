@@ -59,6 +59,43 @@ comment it out) to go back to the packed script.
 Still needs a rebuild and a game restart: anything else in the pack, which is the hotkey names,
 the ability catalog, and the hand-over code at the top of the script itself.
 
+## Rules of the game's script environment (learned the hard way)
+
+- **UI context objects (`cco(...)`, ability lists, `PerformAbilityForOwner`, the selection) only
+  from the UI side**: real timers (`bm:repeat_real_callback`) and UI events (shortcuts, clicks).
+- **The battle model (units, armies, alliances, `bm:time_elapsed_ms()`, unit controllers) only
+  from the game-clock side**: `bm:repeat_callback`, `bm:register_repeating_timer`, phase
+  changes, command handlers.
+- Mixing them corrupts the game's state: after the mod read ability lists from a game-clock
+  timer, the game's own `out()` started printing a function instead of the game time. The mock
+  (`test/mock_battle.lua`) raises an error on any mix-up, so the tests catch it.
+- WH3 runs Lua 5.1: no `goto`, no integer division operator.
+
+## Diagnosing in-game problems
+
+1. **Mod log:** `proactive_command_log.txt` in the game folder, rewritten every battle.
+2. **The game's own script log:** create an empty file named `enable_console_logging` in
+   `...\Total War WARHAMMER III\data\script\`. Every session then writes a
+   `script_log_DDMMYY_HHMM.txt` in the game folder with all script output and script errors,
+   each line prefixed with real time and game time. Delete the file to switch it off.
+3. **`debug_bisect`** in `proactive_command_config.lua`: `true` (or a step number to start at)
+   makes the mod run one kind of game call per second at battle start, logging each step
+   before and after, followed by normal ticks. Two "canary" timers that only count, and a
+   status line every 2 seconds written from the UI side, show whether the game's timers are
+   still firing.
+
+### Open issue (v0.4.0-beta.1)
+
+In real battles, right after the mod's first *normal* tick, the game stops **all** game-clock
+script timers, including the trivial canaries; UI-side timers keep running and the game itself
+continues. With `debug_bisect`, all 33 read-only query kinds (steps 1-33, including a full
+snapshot of 24 units) ran for 34 seconds without a problem. The first normal tick after that
+stopped everything, without casting or ordering anything. That tick still called
+`army:unique_id()` and `unit:is_ai_controlled()`; both are now gone from normal ticks and are
+diagnosis steps 34 and 35, followed by `ordered_position/bearing/width` (36), creating a unit
+controller (37), ability decisions (38) and engagement planning (39). The next test with
+`debug_bisect = 33` should show which step stops the timers, or that the mod now works.
+
 ## Regenerate the ability catalog (after a game patch, or for an overhaul)
 
 The catalog is read from the game's own packs, which are zstd-compressed, so this needs

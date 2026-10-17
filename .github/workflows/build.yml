@@ -47,6 +47,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          pre=""
+          case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
           gh release create "$GITHUB_REF_NAME" dist/*.zip \
             --title "Proactive Command $GITHUB_REF_NAME" \
-            --notes-file dist/RELEASE_NOTES.md
+            --notes-file dist/RELEASE_NOTES.md $pre

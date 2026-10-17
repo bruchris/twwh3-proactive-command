@@ -41,8 +41,13 @@ army. You can still give any order at any time.
   - **You stay in charge:**
     - Units in guard mode hold.
     - A unit you just gave an order to is left alone for 8 seconds.
-    - Units only react to enemies within their engage radius, so nobody charges across the
-      map at the start of a battle.
+    - Until the fighting starts, units only react to enemies within their engage radius, so
+      nobody charges across the map when deployment ends.
+  - **Unlimited reach after first contact:** once the first units clash or shots are fired,
+    every unit above 25% health looks for targets anywhere on the field. For example, cavalry
+    that has run down a routing unit goes straight for the next target. Nearer targets are
+    still preferred, and missile units still only shoot what is in range. Set
+    `engage_unlimited = false` to keep the engage radius for the whole battle.
   - **Disable Just Good Babysitter.** Both mods give orders to idle units, so only use one of
     them. If both are active, the log and a message at the start of the battle remind you.
 
@@ -51,8 +56,8 @@ army. You can still give any order at any time.
 1. Download `ProactiveCommand-<version>.zip` from the [latest release](https://github.com/bruchris/twwh3-proactive-command/releases/latest).
 2. Extract the zip and double-click **`Install.bat`**. It finds the game through Steam (it asks
    for the folder if it can't) and copies the mod into the game's `data` folder.
-3. Open the game launcher, go to **Mods**, and tick **proactive_command**. Untick Just Good
-   Babysitter if you use it.
+3. Open the game launcher (or your mod manager), go to **Mods**, and tick **proactive_command**.
+   Untick Just Good Babysitter if you use it.
 
 To update, download the new zip and run `Install.bat` again; it tells you which version you had
 and which you have now. `Uninstall.bat` removes the mod (your config file and log are kept).
@@ -63,7 +68,7 @@ or right-click the zip, choose **Properties → Unblock**, and extract it again.
 **Manual install:** copy `proactive_command.pack` and `proactive_command.png` into
 `...\steamapps\common\Total War WARHAMMER III\data`.
 
-## Multiplayer (experimental, v0.3)
+## Multiplayer (experimental)
 
 The mod runs in multiplayer battles (co-op and head-to-head, custom and campaign), with one rule:
 **each player's copy only commands that player's own army**. Your friend's army and the enemy
@@ -114,8 +119,11 @@ of every battle, so you don't need to repack anything.
 Set `log_level = 2` to also see why spells were held back, or `log_level = 3` to also see why
 units didn't engage.
 
-## Known limits (v0.3)
+## Known limits
 
+- **v0.4.0-beta.1 known issue:** in real battles the mod stops after its first second or two,
+  because the game stops its script timers right after the mod's first normal tick. The cause
+  is being narrowed down; see the release notes and docs/DEVELOPMENT.md for how to help test.
 - The decisions have only been tested in a simulated battle. The first in-game battles are the
   real test, so watch the log.
 - Targeted casts go through `unitcontroller:perform_special_ability`, which CA's own scripts

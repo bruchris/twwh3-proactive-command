@@ -205,6 +205,7 @@ local function unit_cco(u)
 end
 
 function cco(name, id)
+    if M.ctx == "model" then error("UI context object (cco) used from a game-clock callback", 2) end
     if name ~= "CcoBattleRoot" then return nil end
     return { Call = function(_, expr)
         local uid = string.match(expr, "^UnitList%.FirstContext%(UniqueUiId == (%d+)%)$")
@@ -230,10 +231,33 @@ function bm:get_non_player_alliance() return M.alliances[2] end
 function bm:get_player_army() return M.alliances[1].army_list[1] end
 function bm:local_army() return M.local_army or 1 end
 function bm:local_alliance() return 1 end
-function bm:repeat_callback(fn, ms, name) M.repeat_cbs[name or tostring(fn)] = { fn = fn, every = ms / 1000, next = M.time + ms / 1000 } end
+function bm:repeat_callback(fn, ms, name)
+    if M.shared_timer_dead then return end
+    M.repeat_cbs[name or tostring(fn)] = { fn = fn, every = ms / 1000, next = M.time + ms / 1000, shared = true }
+end
+function bm:register_repeating_timer(fname, ms)
+    M.repeat_cbs["engine:" .. fname] = { fn = function() _G[fname]() end, every = ms / 1000, next = M.time + ms / 1000 }
+end
+function bm:unregister_timer(fname) M.repeat_cbs["engine:" .. fname] = nil end
+function bm:time_elapsed_ms() return math.floor(M.time * 1000 + 0.5) end
+-- the mod uses os.clock() as its real-time clock; follow the mock's time
+os.clock = function() return M.time end
+-- simulate another script's error killing the game's shared timer chain
+function M.kill_shared_timer()
+    M.shared_timer_dead = true
+    for name, cb in pairs(M.repeat_cbs) do if cb.shared then M.repeat_cbs[name] = nil end end
+end
 function bm:callback(fn, ms, name) M.repeat_cbs[name or tostring(fn)] = { fn = fn, once = true, next = M.time + ms / 1000 } end
 function bm:real_callback(fn, ms, name) M.real_cbs[name or tostring(fn)] = { fn = fn, next = M.time + ms / 1000 } end
 function bm:remove_real_callback(name) M.real_cbs[name] = nil end
+function bm:repeat_real_callback(fn, ms, name)
+    M.real_cbs[name or tostring(fn)] = { fn = fn, next = M.time + ms / 1000, every = ms / 1000 }
+end
+-- simulate every game-model timer stopping (only UI timers keep running)
+function M.kill_model_timers()
+    M.shared_timer_dead = true
+    for name in pairs(M.repeat_cbs) do M.repeat_cbs[name] = nil end
+end
 function bm:remove_process(name) M.repeat_cbs[name] = nil end
 function bm:register_phase_change_callback(phase, fn) M.phase_cbs[phase] = M.phase_cbs[phase] or {}; table.insert(M.phase_cbs[phase], fn) end
 function bm:is_tutorial() return false end
@@ -244,7 +268,7 @@ function bm:register_command_handler_callback(name, fn, cbname) M.commands[name]
 function bm:unregister_command_handler_callback(name, cbname) M.commands[name] = nil end
 function M.player_command(name, units)
     M.selection = units
-    for _, fn in ipairs(M.commands[name] or {}) do fn({ get_name = function() return name end }) end
+    for _, fn in ipairs(M.commands[name] or {}) do M.in_ctx("model", fn, { get_name = function() return name end }) end
 end
 
 core = {}
@@ -274,13 +298,27 @@ end
 function out(s) M.log[#M.log + 1] = s end
 
 -- driving -------------------------------------------------------------------------------
+-- Which kind of callback is running: "model" (game-clock timers, phase changes, commands)
+-- or "ui" (real timers, UI events such as shortcuts). The real game only allows UI context
+-- objects (cco) from the UI side and game-model queries from the model side; the mock
+-- raises an error on a violation so the tests catch it.
+M.ctx = nil
+local function in_ctx(ctx, fn, ...)
+    local prev = M.ctx
+    M.ctx = ctx
+    local ok, err = pcall(fn, ...)
+    M.ctx = prev
+    if not ok then error(err, 0) end
+end
+M.in_ctx = in_ctx
+
 function M.phase(name)
-    for _, fn in ipairs(M.phase_cbs[name] or {}) do fn() end
+    for _, fn in ipairs(M.phase_cbs[name] or {}) do in_ctx("model", fn) end
 end
 
 function M.shortcut(str)
     for _, l in ipairs(M.listeners) do
-        if l.event == "ShortcutTriggered" and l.cond({ string = str }) then l.cb({ string = str }) end
+        if l.event == "ShortcutTriggered" and l.cond({ string = str }) then in_ctx("ui", l.cb, { string = str }) end
     end
 end
 
@@ -308,11 +346,14 @@ function M.advance(seconds, dt)
         for name, cb in pairs(M.repeat_cbs) do
             if M.time + 1e-9 >= cb.next then
                 if cb.once then M.repeat_cbs[name] = nil else cb.next = cb.next + cb.every end
-                cb.fn()
+                in_ctx("model", cb.fn)
             end
         end
         for name, cb in pairs(M.real_cbs) do
-            if M.time + 1e-9 >= cb.next then M.real_cbs[name] = nil; cb.fn() end
+            if M.time + 1e-9 >= cb.next then
+                if cb.every then cb.next = cb.next + cb.every else M.real_cbs[name] = nil end
+                in_ctx("ui", cb.fn)
+            end
         end
     end
 end
@@ -393,6 +434,27 @@ function M.attacks(by)
         if e.kind == "attack" and (not by or e.by == by) then r[#r + 1] = e end
     end
     return r
+end
+
+-- game-model queries are not allowed from UI callbacks
+local function guard_model(tbl, label)
+    for k, fn in pairs(tbl) do
+        if type(fn) == "function" and k:sub(1, 2) ~= "__" then
+            tbl[k] = function(...)
+                if M.ctx == "ui" then error("game-model call " .. label .. ":" .. k .. " from a UI callback", 2) end
+                return fn(...)
+            end
+        end
+    end
+end
+guard_model(UnitMT, "unit")
+guard_model(ArmyMT, "army")
+for _, k in ipairs({ "time_elapsed_ms", "get_player_alliance", "get_non_player_alliance", "get_player_army", "local_army", "local_alliance" }) do
+    local fn = bm[k]
+    bm[k] = function(...)
+        if M.ctx == "ui" then error("game-model call bm:" .. k .. " from a UI callback", 2) end
+        return fn(...)
+    end
 end
 
 return M

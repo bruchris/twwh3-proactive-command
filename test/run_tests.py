@@ -333,6 +333,122 @@ def dev_mode_broken_copy_falls_back():
 
 
 @scenario
+def heartbeat_and_pause_logged():
+    """
+    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, melee = true,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
+    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 200 })
+    setup_done()
+    M.advance(2)
+    local log = io.open("proactive_command_log.txt"):read("*a")
+    expect(log:find("tick 1: 1 of your units under the mod", 1, true), "heartbeat shows how many units the mod controls")
+    proactive_command.toggle()
+    M.advance(3)
+    log = io.open("proactive_command_log.txt"):read("*a")
+    expect(log:find("paused: doing nothing", 1, true), "pausing shows up in the log right away")
+    M.advance(10)
+    log = io.open("proactive_command_log.txt"):read("*a")
+    expect(not log:find("summary", 1, true), "no summaries while paused")
+    proactive_command.toggle()
+    M.advance(12)
+    log = io.open("proactive_command_log.txt"):read("*a")
+    expect(log:find("summary", 1, true), "summaries resume")
+    """
+
+
+@scenario
+def survives_shared_timer_dying():
+    """
+    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, melee = true,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 20, dur = 5 } } })
+    local en = M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
+    setup_done()
+    M.advance(1.5)
+    M.kill_shared_timer()                 -- another mod's callback errors at 1.5 s
+    M.advance(60)
+    local log = io.open("proactive_command_log.txt"):read("*a")
+    expect(log:find("timers: game-clock engine on, game-clock shared on, ui on", 1, true), "all three timers are started")
+    expect(log:find("tick 3:", 1, true), "ticks keep coming on the engine timer")
+    expect(#M.casts() >= 2, "the lord keeps casting after the shared timer died (" .. #M.casts() .. ")")
+    local n = 0
+    for _ in log:gmatch("summary:") do n = n + 1 end
+    expect(n >= 2, "summaries keep coming")
+    """
+
+
+@scenario
+def model_timers_dying_is_reported():
+    """
+    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, melee = true,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 20, dur = 5 } } })
+    local en = M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
+    setup_done()
+    M.advance(1.5)
+    M.kill_model_timers()                 -- both game-clock timers stop
+    M.advance(10)                         -- the UI side keeps running but never queries the game model
+    local log = io.open("proactive_command_log.txt"):read("*a")
+    expect(log:find("no game-clock tick for 4 s", 1, true), "a stall is reported in the log")
+    """
+
+
+@scenario
+def ui_and_model_sides_stay_separate():
+    """
+    -- the mock raises an error if a UI context object is used from a game-clock callback or the
+    -- game model is queried from a UI callback; a full battle with casts, engagements, hotkeys
+    -- and player orders must run without a single such error
+    M.simulate = true
+    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, melee = true, x = 0, z = 0,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 30, dur = 10 } } })
+    local wiz = M.add_unit(P, { name = "wizard", type = "wh_main_emp_cha_wizard_fire_0", men = 1, is_character = true, x = -30, z = -20,
+        abilities = { { key = "wh_main_spell_fire_fireball", targeted = true, mana = 6, cd = 15 } } })
+    local cav = M.add_unit(P, { name = "reiksguard", type = "wh_main_emp_cav_reiksguard", x = 60, z = 0 })
+    local sw = M.add_unit(P, { name = "swordsmen", type = "wh_main_emp_inf_swordsmen", x = 20, z = 0 })
+    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 60 })
+    M.add_unit(E, { name = "warriors2", type = "wh3_main_kho_inf_chaos_warriors_0", x = 50, z = 80 })
+    M.add_unit(E, { name = "archers", type = "wh3_main_kho_inf_marauder_archers", x = 90, z = 140 })
+    setup_done()
+    M.advance(5)
+    M.selection = { sw }
+    M.shortcut("camera_bookmark_save9")   -- cycle mode of the selected unit (UI event)
+    M.player_command("Move", { sw })      -- player order (model-side command handler)
+    M.advance(30)
+    local log = io.open("proactive_command_log.txt"):read("*a")
+    expect(not log:find("ERROR", 1, true), "no errors at all: " .. log)
+    expect(#M.casts() >= 1, "abilities are cast (" .. #M.casts() .. ")")
+    expect(#M.attacks() >= 1, "units engage (" .. #M.attacks() .. ")")
+    """
+
+
+@scenario
+def debug_bisect_steps():
+    """
+    local f = io.open("proactive_command_config.lua", "w"); f:write("return { debug_bisect = true }"); f:close()
+    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, melee = true,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 20, dur = 5 } } })
+    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
+    setup_done()
+    M.advance(45)
+    local log = io.open("proactive_command_log.txt"):read("*a")
+    expect(log:find("bisect 1/", 1, true), "bisect starts")
+    expect(log:find("bisect finished", 1, true), "bisect runs through all steps")
+    expect(log:find("status: ticks=", 1, true), "status lines from the UI side")
+    expect(#M.casts() >= 1, "normal ticks afterwards (casts " .. #M.casts() .. ")")
+    """
+
+
+@scenario
+def no_double_ticks():
+    """
+    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, melee = true })
+    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 300 })
+    setup_done()
+    M.advance(30)
+    expect(math.abs(proactive_command.state.now - 30) <= 1.5, "one tick per second with two timers, now=" .. tostring(proactive_command.state.now))
+    """
+
+
+@scenario
 def vortex_path_safety():
     """
     local wiz = M.add_unit(P, { name = "death_wizard", type = "wh_main_emp_cha_wizard_fire_0", men = 1, is_character = true, x = 0, z = 0,
@@ -379,6 +495,39 @@ def engage_guard_and_leash():
     M.advance(2)
     expect(#M.attacks("swordsmen") == 1, "idle unit engages an enemy that comes within range")
     expect(#M.attacks("guarded") == 0, "guard mode holds position")
+    """
+
+
+@scenario
+def engage_unlimited_reach_after_contact():
+    """
+    -- a fight far to the left starts the battle; our cavalry far to the right has nothing nearby
+    local sw = M.add_unit(P, { name = "swordsmen", type = "wh_main_emp_inf_swordsmen", x = -300, z = 0, melee = true })
+    local cav = M.add_unit(P, { name = "reiksguard", type = "wh_main_emp_cav_reiksguard", x = 300, z = 0 })
+    local hurt = M.add_unit(P, { name = "hurt_cav", type = "wh_main_emp_cav_reiksguard", x = 320, z = 0, hp = 0.2 })
+    local foe = M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = -300, z = 10, melee = true })
+    local far = M.add_unit(E, { name = "archers", type = "wh3_main_kho_inf_marauder_archers", x = 300, z = 650 })
+    setup_done()
+    M.advance(3)
+    local log = io.open("proactive_command_log.txt"):read("*a")
+    expect(log:find("contact: the fighting has started", 1, true), "first contact is detected")
+    local a = M.attacks("reiksguard")
+    expect(#a >= 1, "healthy cavalry goes for a target far outside its old 180 m reach")
+    expect(#M.attacks("hurt_cav") == 0, "a unit below 25% health stays out")
+    """
+
+
+@scenario
+def engage_unlimited_off():
+    """
+    local f = io.open("proactive_command_config.lua", "w"); f:write("return { engage_unlimited = false }"); f:close()
+    local sw = M.add_unit(P, { name = "swordsmen", type = "wh_main_emp_inf_swordsmen", x = -300, z = 0, melee = true })
+    local cav = M.add_unit(P, { name = "reiksguard", type = "wh_main_emp_cav_reiksguard", x = 300, z = 0 })
+    local foe = M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = -300, z = 10, melee = true })
+    local far = M.add_unit(E, { name = "archers", type = "wh3_main_kho_inf_marauder_archers", x = 300, z = 650 })
+    setup_done()
+    M.advance(3)
+    expect(#M.attacks("reiksguard") == 0, "with engage_unlimited = false the 180 m reach applies")
     """
 
 

@@ -17,7 +17,7 @@
 --   proactive_command_log.txt
 --------------------------------------------------------------------------------
 
-local VERSION = "0.3.1"
+local VERSION = "0.4.0-beta.1"
 
 if proactive_command_loaded then return end
 
@@ -101,6 +101,12 @@ local DEFAULTS = {
     engage_radius = {                 -- max distance (m) a unit will go to find a target
         infantry = 110, anti_large = 110, cavalry = 180, monster = 140, character = 130, missile = 0,
     },                                -- missile = 0 means "within its own missile range"
+    engage_unlimited = true,          -- once the fighting has started, healthy units (above
+                                      -- min_hp_to_engage) look for targets anywhere on the field
+                                      -- instead of only within engage_radius; missile units still
+                                      -- only shoot what is in range
+    engage_unlimited_from_start = false, -- also before the first contact (the army may then march
+                                      -- off on its own as soon as deployment ends)
     engage_characters = true,         -- melee lords/heroes join fights on their own
     engage_casters = false,           -- spellcasters keep their distance
     engage_artillery = false,         -- artillery already fires at will
@@ -117,6 +123,8 @@ local DEFAULTS = {
     log_level = 1,                    -- 0 off, 1 casts + summary, 2 decisions, 3 debug
     log_file = "proactive_command_log.txt",
     user_config_file = "proactive_command_config.lua",
+    debug_bisect = false,             -- development: at battle start, try one kind of game query
+                                      -- per tick (logged) to find a query that stops the timers
     dev_script_path = false,          -- development: run this loose copy of the script instead
                                       -- of the packed one (read at the top of the file)
 
@@ -146,7 +154,13 @@ local S = {
     issuing = false,    -- true while the mod itself gives orders (ignore those in the command handler)
     log_buf = {},
     log_path = nil,
-    next_summary = 30,
+    next_summary = 10,
+    ticks = 0,
+    last_driver_ms = {},
+    driver_calls = {},
+    ab_cache = {},      -- uid -> ability states read on the UI side
+    cast_queue = {},    -- button-style casts decided on the model side, pressed on the UI side
+    ui_watch = {},      -- uids whose abilities the UI side should read
 }
 
 --------------------------------------------------------------------------------
@@ -272,6 +286,10 @@ local function try(fn, ...)
     return nil
 end
 
+local function clock()
+    return (os and os.clock and os.clock()) or 0
+end
+
 local function cco_call(obj, expr)
     if not obj then return nil end
     local ok, r = pcall(function() return obj:Call(expr) end)
@@ -339,13 +357,11 @@ end
 
 -- In multiplayer only the local player's own army is ours to command; other human
 -- players' armies (and their copy of this mod) are left alone.
-local function is_commandable_army(army)
+local function is_commandable_army(army, index)
     if not S.mp then return try(army.is_player_controlled, army) end
-    local own = S.own_army
-    if not own then return false end
-    local a, b = try(army.unique_id, army), try(own.unique_id, own)
-    if a ~= nil and b ~= nil then return a == b end
-    return army == own
+    -- army objects can't be compared reliably (each lookup may return a new wrapper),
+    -- so the local player's army is identified by its index in the alliance
+    return index == S.own_army_idx
 end
 
 -- An army's own units plus any reinforcement units that have arrived on the field.
@@ -368,7 +384,7 @@ local function take_snapshot()
     local armies = pa:armies()
     for i = 1, armies:count() do
         local army = armies:item(i)
-        local is_player = is_commandable_army(army)
+        local is_player = is_commandable_army(army, i)
         local list = {}
         for_each_army_unit(army, function(unit)
             local u = snapshot_unit(unit, "friend", pa, catalog)
@@ -381,7 +397,7 @@ local function take_snapshot()
             end
         end)
         if is_player then
-            snap.player_armies[#snap.player_armies + 1] = { army = army, units = list }
+            snap.player_armies[#snap.player_armies + 1] = { army = army, units = list, key = "army" .. i }
         end
     end
     local earmies = ea:armies()
@@ -741,15 +757,16 @@ local function unit_state(uid)
     return st
 end
 
-local function read_abilities(u, st)
-    local root = cco("CcoBattleRoot", "")
-    if not root then return {} end
-    local uc = cco_call(root, "UnitList.FirstContext(UniqueUiId == " .. tostring(u.uid) .. ")")
-    if not uc then return {} end
-    u.cco = uc
-    if st.is_character == nil then st.is_character = cco_call(uc, "IsCharacter") and true or false end
-    u.is_character = st.is_character
-    local list = {}
+-- The game only allows its UI context objects (cco) to be used from the UI side (real timers,
+-- UI events) and its battle model to be queried from the model side (game-clock timers,
+-- phase changes). Mixing them breaks the game's script state. So ability states are read on
+-- the UI side (ui_step, below) into S.ab_cache, and the model-side tick only reads that cache.
+
+-- UI side only: read one unit's abilities from the UI context objects
+local function ui_read_abilities(root, uid)
+    local uc = cco_call(root, "UnitList.FirstContext(UniqueUiId == " .. tostring(uid) .. ")")
+    if not uc then return nil end
+    local entry = { at = clock(), is_character = cco_call(uc, "IsCharacter") and true or false, list = {}, by_key = {} }
     local n = tonumber(cco_call(uc, "BattleAbilityList.Size")) or 0
     for k = 0, n - 1 do
         local ab = cco_call(uc, "BattleAbilityList.At(" .. k .. ")")
@@ -757,7 +774,7 @@ local function read_abilities(u, st)
             local key = cco_call(ab, "SetupAbilityContext.RecordKey")
             if key and not cco_call(ab, "SetupAbilityContext.IsPassive") then
                 local info = {
-                    key = key, cco = ab,
+                    key = key,
                     can = cco_call(ab, "CanCurrentlyPerform") and true or false,
                     active = cco_call(ab, "IsActive") and true or false,
                     aiming = cco_call(ab, "IsCurrentlyTargetting") and true or false,
@@ -766,11 +783,23 @@ local function read_abilities(u, st)
                 if cco_call(ab, "HasLimitedUses") then
                     info.remaining = tonumber(cco_call(ab, "RemainingUses"))
                 end
-                list[#list + 1] = info
+                entry.list[#entry.list + 1] = info
+                entry.by_key[key] = ab
             end
         end
     end
-    return list
+    return entry
+end
+
+-- Model side: the most recent ability states the UI side read for this unit
+-- (nil = not known yet, e.g. the UI side has not read this unit yet or the reading is stale)
+local function read_abilities(u, st)
+    local c = S.ab_cache[u.uid]
+    if not c then return nil end
+    st.is_character = c.is_character
+    u.is_character = c.is_character
+    if clock() - c.at > 3 then return nil end
+    return c.list
 end
 
 --------------------------------------------------------------------------------
@@ -792,7 +821,6 @@ end
 
 local function claimed_by_other_mod(u)
     if not cfg.skip_ai_controlled then return false end
-    if try(u.unit.is_ai_controlled, u.unit) then return true end
     if modder_API_uc_manager and type(modder_API_uc_manager.is_unit_claimed) == "function" then
         local ok, owner = pcall(modder_API_uc_manager.is_unit_claimed, modder_API_uc_manager, tostring(u.uid))
         if ok and owner then return true end
@@ -835,8 +863,10 @@ local function issue(u, st, info, A, cand)
     local method
     local ok, err
     if not info.targeted then
+        -- the ability button lives in the UI: the UI side presses it (ui_step)
         method = "cco"
-        ok, err = pcall(function() info.cco:Call("PerformAbilityForOwner") end)
+        S.cast_queue[#S.cast_queue + 1] = { uid = u.uid, key = key, name = A.n or key, type = u.type, at = clock() }
+        ok = true
     else
         local uc = get_uc(u, st)
         local unit_target = not cand.ground and T.unit and (
@@ -884,8 +914,10 @@ local function verify_pending(snap)
         else
             local u = snap.by_uid[p.uid]
             local st = S.units[p.uid]
-            if u and st then
-                local abilities = read_abilities(u, st)
+            local abilities = u and st and read_abilities(u, st)
+            if u and st and not abilities and S.now < p.check_at + 5 then
+                keep[#keep + 1] = p   -- ability states not read yet: check again next tick
+            elseif u and st and abilities then
                 local fired = false
                 for _, info in ipairs(abilities) do
                     if info.key == p.key then
@@ -956,7 +988,7 @@ end
 
 local function process_army(pa, snap)
     local army = pa.army
-    local aid = try(army.unique_id, army) or tostring(army)
+    local aid = pa.key or "army"
     local actx = S.armies[aid]
     if not actx then
         actx = { last_spell = -100, max_pool = 0, casts = 0 }
@@ -973,12 +1005,12 @@ local function process_army(pa, snap)
         local mode = unit_mode(u, st)
         if mode ~= "off" and not u.routing and not u.shattered and S.now >= st.next_issue
             and S.now >= st.idle_until and not claimed_by_other_mod(u) then
-            local abilities = read_abilities(u, st)
+            local abilities = read_abilities(u, st) or {}
             local known = false
             for _, info in ipairs(abilities) do
                 if S.catalog.abilities[info.key] then known = true end
             end
-            if not known then st.idle_until = S.now + 10 end  -- nothing to do; look again later
+            if not known and S.ab_cache[u.uid] then st.idle_until = S.now + 10 end  -- nothing to do; look again later
             local player_aiming = false
             for _, info in ipairs(abilities) do
                 if info.aiming then player_aiming = true end
@@ -1091,6 +1123,12 @@ local function anti_large(u)
     return u.stats and ((u.stats.al or 0) >= 8 or u.stats.c == "inf_spr") or false
 end
 
+-- Unlimited reach: after first contact (or from the start, if configured) units look for
+-- targets anywhere on the field. Before that, engage_radius keeps the army in place.
+local function unlimited_reach()
+    return cfg.engage_unlimited and (S.contact or cfg.engage_unlimited_from_start) or false
+end
+
 local function engage_radius(u, r)
     local radii = cfg.engage_radius or {}
     if r == "missile" then
@@ -1098,6 +1136,7 @@ local function engage_radius(u, r)
         if m <= 0 then return (u.missile_range or 0) + 5 end
         return m
     end
+    if unlimited_reach() then return math.huge end
     return radii[r] or 110
 end
 
@@ -1229,7 +1268,9 @@ local function engage_score(f, fr, e, ctx, snap)
                 local de, df = dist_xz(e.x, e.z, cx, cz), dist_xz(f.x, f.z, cx, cz)
                 if de > 120 and de > df + 80 then
                     local soft = (er == "missile" or er == "artillery" or er == "caster")
-                    score = score - ((soft and fr == "cavalry") and 0.15 or 0.45); tags[#tags + 1] = "far from army"
+                    -- with unlimited reach this is only a preference for targets near the army
+                    local pen = ((soft and fr == "cavalry") or unlimited_reach()) and 0.15 or 0.45
+                    score = score - pen; tags[#tags + 1] = "far from army"
                 end
             end
         end
@@ -1244,7 +1285,10 @@ local function engage_score(f, fr, e, ctx, snap)
     local need = power(e) * 1.0
     if (ctx.committed[e.uid] or 0) >= need then score = score * 0.35; tags[#tags + 1] = "covered" end
     -- travel time (steep for the first 15 s, then flatter so distant but needed fights still happen)
-    score = score - 0.02 * math.min(ttr, 15) - 0.005 * math.max(0, ttr - 15)
+    local travel = 0.02 * math.min(ttr, 15) + 0.005 * math.max(0, ttr - 15)
+    -- with unlimited reach, nearer targets are still preferred, but distance alone never rules one out
+    if unlimited_reach() then travel = math.min(travel, 0.3) end
+    score = score - travel
     return score, table.concat(tags, ",")
 end
 
@@ -1380,19 +1424,10 @@ local PLAYER_COMMANDS = { "Move", "Move Orientation Width", "Move Rotation Angle
     "Attack", "Attack Unit", "Attack Building", "Attack Position", "Melee Mode", "Skirmish", "Fire At Will" }
 
 local function on_player_command()
+    -- runs on the model side: just note the time; the UI side looks up which units were
+    -- selected (ui_step) and gives them the grace period
     if S.issuing then return end
-    local root = cco("CcoBattleRoot", "")
-    local sel = cco_call(root, "SelectionContext")
-    local n = tonumber(cco_call(sel, "NumUnits")) or 0
-    for i = 0, n - 1 do
-        local bu = cco_call(sel, "UnitList.At(" .. i .. ")")
-        local id = bu and cco_call(bu, "UniqueUiId")
-        if id then
-            local st = unit_state(tonumber(id) or id)
-            st.player_order_at = S.now
-            st.engaged_target = nil
-        end
-    end
+    S.player_cmd_pending = S.now
 end
 
 local function register_command_watch()
@@ -1418,10 +1453,213 @@ local function prune()
     S.areas = keep
 end
 
-local function tick()
+-- Development aid (debug_bisect): one kind of game query per tick, each logged before and
+-- after, so if the game's timers stop, the last logged step shows which query preceded it.
+local function bisect_units(fn)
+    local n = 0
+    local function each_alliance(al, own)
+        local armies = al:armies()
+        for i = 1, armies:count() do
+            local army = armies:item(i)
+            if not own or army:is_player_controlled() then
+                local units = army:units()
+                for j = 1, units:count() do fn(units:item(j), army, al); n = n + 1 end
+            end
+        end
+    end
+    each_alliance(bm:get_player_alliance(), true)
+    each_alliance(bm:get_non_player_alliance(), false)
+    return n
+end
+local function unit_call(name, ...)
+    local args = { ... }
+    return function() return bisect_units(function(u) local f = u[name]; if f then f(u, unpack(args)) end end) end
+end
+local BISECT = {
+    { "nothing (heartbeat only)", function() return 0 end },
+    { "alliances, armies, unit lists", function() return bisect_units(function() end) end },
+    { "unique_ui_id", unit_call("unique_ui_id") },
+    { "number_of_men_alive", unit_call("number_of_men_alive") },
+    { "position", function() return bisect_units(function(u) local p = u:position(); local _ = p:get_x() + p:get_z() end) end },
+    { "unary_hitpoints", unit_call("unary_hitpoints") },
+    { "is_in_melee", unit_call("is_in_melee") },
+    { "is_moving", unit_call("is_moving") },
+    { "is_moving_fast", unit_call("is_moving_fast") },
+    { "is_idle", unit_call("is_idle") },
+    { "is_routing", unit_call("is_routing") },
+    { "is_crumbling", unit_call("is_crumbling") },
+    { "is_unstable", unit_call("is_unstable") },
+    { "is_shattered", unit_call("is_shattered") },
+    { "is_wavering", unit_call("is_wavering") },
+    { "is_currently_flying", unit_call("is_currently_flying") },
+    { "can_fly", unit_call("can_fly") },
+    { "is_under_missile_attack", unit_call("is_under_missile_attack") },
+    { "fast_speed", unit_call("fast_speed") },
+    { "slow_speed", unit_call("slow_speed") },
+    { "type", unit_call("type") },
+    { "can_use_magic", unit_call("can_use_magic") },
+    { "is_behaviour_active(defend)", unit_call("is_behaviour_active", "defend") },
+    { "ammo_left", unit_call("ammo_left") },
+    { "starting_ammo", unit_call("starting_ammo") },
+    { "missile_range", unit_call("missile_range") },
+    { "current_target", unit_call("current_target") },
+    { "is_leaving_battle", unit_call("is_leaving_battle") },
+    { "is_valid_target", unit_call("is_valid_target") },
+    { "is_visible_to_alliance (enemies)", function()
+        local pa = bm:get_player_alliance()
+        return bisect_units(function(u, army, al) if al ~= pa and u.is_visible_to_alliance then u:is_visible_to_alliance(pa) end end)
+    end },
+    { "reinforcement units", function()
+        local n = 0
+        for _, al in ipairs({ bm:get_player_alliance(), bm:get_non_player_alliance() }) do
+            local armies = al:armies()
+            for i = 1, armies:count() do
+                local army = armies:item(i)
+                local k = army.num_reinforcement_units and army:num_reinforcement_units() or 0
+                for r = 1, k do local c = army:get_reinforcement_units(r); n = n + (c and c:count() or 0) end
+            end
+        end
+        return n
+    end },
+    { "army winds of magic", function()
+        local armies = bm:get_player_alliance():armies()
+        for i = 1, armies:count() do
+            local a = armies:item(i)
+            if a.winds_of_magic_current then a:winds_of_magic_current() end
+            if a.winds_of_magic_reserve then a:winds_of_magic_reserve() end
+        end
+        return armies:count()
+    end },
+    { "full snapshot", function() local snap = take_snapshot(); return #snap.friends + #snap.enemies end },
+    { "army unique_id (old code)", function()
+        local armies = bm:get_player_alliance():armies()
+        for i = 1, armies:count() do local a = armies:item(i); if a.unique_id then a:unique_id() end end
+        return armies:count()
+    end },
+    { "is_ai_controlled (old code)", unit_call("is_ai_controlled") },
+    { "ordered_position / bearing / width", function()
+        local n = 0
+        local armies = bm:get_player_alliance():armies()
+        for i = 1, armies:count() do
+            local units = armies:item(i):units()
+            for j = 1, units:count() do
+                local u = units:item(j)
+                if u.ordered_position then u:ordered_position() end
+                if u.ordered_bearing then u:ordered_bearing() end
+                if u.ordered_width then u:ordered_width() end
+                n = n + 1
+            end
+        end
+        return n
+    end },
+    { "unit:army() + create_unit_controller (one unit, no orders)", function()
+        local u = bm:get_player_alliance():armies():item(1):units():item(1)
+        local uc = u:army():create_unit_controller()
+        uc:add_units(u)
+        return 1
+    end },
+    { "ability decisions (may cast)", function()
+        local snap = take_snapshot()
+        S.last_snap = snap
+        for _, pa in ipairs(snap.player_armies) do process_army(pa, snap) end
+        return #snap.friends
+    end },
+    { "engagement planning (may give attack orders)", function()
+        local snap = take_snapshot()
+        run_engagement(snap)
+        return #snap.friends
+    end },
+}
+
+local function run_bisect_step()
+    -- debug_bisect = true starts at step 1; a number starts at that step
+    if not S.bisect_i and type(cfg.debug_bisect) == "number" then S.bisect_i = math.max(0, cfg.debug_bisect - 1) end
+    S.bisect_i = (S.bisect_i or 0) + 1
+    local step = BISECT[S.bisect_i]
+    if not step then return false end
+    log(1, "bisect %d/%d: %s", S.bisect_i, #BISECT, step[1])
+    flush_log()
+    local ok, r = pcall(step[2])
+    log(1, "  bisect %d done (%s)", S.bisect_i, ok and ("ok, " .. tostring(r) .. " units") or ("error: " .. tostring(r)))
+    flush_log()
+    return true
+end
+
+local function tick(driver)
+    -- Several timers drive the tick (see start_battle); it runs once per interval, whichever
+    -- fires first. The two game-clock timers are preferred: they stop while the game is
+    -- paused, and the game can be queried safely from them. The UI timer only takes over
+    -- when neither game-clock timer has fired for a while (CA: the game "may not be in a
+    -- suitable state to be queried" from a UI timer, so it never reads the game time).
+    -- model side only: two game-clock timers drive this; run once per interval
+    local now = clock()
+    S.last_model_clock = now
+    local ms = try(bm.time_elapsed_ms, bm)
+    if type(ms) ~= "number" then ms = nil end
+    if ms then
+        if S.last_tick_ms and ms - S.last_tick_ms < cfg.tick_seconds * 600 then return end
+        S.last_tick_ms = ms
+    else
+        if S.last_tick_clock and now - S.last_tick_clock < cfg.tick_seconds * 0.6 then return end
+    end
+    S.last_tick_clock = now
+    if S.stall_logged then
+        S.stall_logged = false
+        log(1, "note: game-clock ticks are running again")
+    end
     S.now = S.now + cfg.tick_seconds
-    if not S.running or S.paused then return end
+    if not S.running then
+        if not S.not_running_logged then S.not_running_logged = true; log(1, "tick skipped: not running"); flush_log() end
+        return
+    end
+    if S.paused then
+        if not S.pause_logged then
+            S.pause_logged = true
+            log(1, "paused: doing nothing until the pause key is pressed again")
+            flush_log()
+        end
+        return
+    end
+    S.pause_logged = false
+    S.ticks = (S.ticks or 0) + 1
+    if cfg.debug_bisect and not S.bisect_done then
+        if run_bisect_step() then return end
+        S.bisect_done = true
+        log(1, "bisect finished: all steps ran; normal ticks from now on")
+    end
     local snap = take_snapshot()
+    S.last_snap = snap
+    -- tell the UI side which units' abilities to read
+    local watch = {}
+    for _, pa in ipairs(snap.player_armies) do
+        for _, u in ipairs(pa.units) do watch[u.uid] = true end
+    end
+    S.ui_watch = watch
+    if not S.contact then
+        for _, u in ipairs(snap.friends) do
+            if u.melee or u.under_fire or u.shooting then S.contact = true; break end
+        end
+        if not S.contact then
+            for _, e in ipairs(snap.enemies) do
+                if e.melee then S.contact = true; break end
+            end
+        end
+        if S.contact then
+            log(1, "contact: the fighting has started%s", unlimited_reach()
+                and "; healthy units now look for targets anywhere on the field" or "")
+        end
+    end
+    if S.ticks <= 3 then
+        local mine, off = 0, 0
+        for _, pa in ipairs(snap.player_armies) do
+            for _, u in ipairs(pa.units) do
+                mine = mine + 1
+                if unit_mode(u, unit_state(u.uid)) == "off" then off = off + 1 end
+            end
+        end
+        log(1, "tick %d: %d of your units under the mod (%d set to off) in %d army(ies); %d friendly and %d visible enemy units",
+            S.ticks, mine, off, #snap.player_armies, #snap.friends, #snap.enemies)
+    end
     verify_pending(snap)
     for _, pa in ipairs(snap.player_armies) do
         process_army(pa, snap)
@@ -1444,6 +1682,7 @@ end
 
 local function toast(text)
     log(1, "%s", text)
+    flush_log()
     if not cfg.show_toasts then return end
     pcall(function()
         local root = core:get_ui_root()
@@ -1498,7 +1737,7 @@ local function cycle_selected()
     local current = (first and first.mode) or nil
     if not current then
         local snap_u
-        for _, f in ipairs(take_snapshot().friends) do if f.uid == ids[1] then snap_u = f end end
+        snap_u = S.last_snap and S.last_snap.by_uid[ids[1]]
         current = snap_u and default_mode(snap_u) or "off"
     end
     local idx = 1
@@ -1511,6 +1750,59 @@ end
 local function toggle_all()
     S.paused = not S.paused
     toast(S.paused and "Proactive Command: paused" or "Proactive Command: active")
+end
+
+-- UI side: read ability states, press queued ability buttons, resolve player orders.
+-- Never queries the battle model (units, armies, game time).
+local function ui_step()
+    if not S.running then return end
+    local root = cco("CcoBattleRoot", "")
+    if not root then return end
+    local now = clock()
+    -- player orders: the units selected when an order was given get the grace period
+    if S.player_cmd_pending then
+        local t = S.player_cmd_pending
+        S.player_cmd_pending = nil
+        for _, id in ipairs(selected_uids()) do
+            local st = unit_state(id)
+            st.player_order_at = t
+            st.engaged_target = nil
+        end
+    end
+    -- ability states for the units the mod looks after
+    for uid in pairs(S.ui_watch) do
+        local entry = ui_read_abilities(root, uid)
+        if entry then S.ab_cache[uid] = entry end
+    end
+    -- press queued ability buttons
+    if #S.cast_queue > 0 then
+        local queue = S.cast_queue
+        S.cast_queue = {}
+        for _, q in ipairs(queue) do
+            if now - q.at <= 3 then
+                local entry = S.ab_cache[q.uid]
+                local ab = entry and entry.by_key[q.key]
+                local ok, err = false, "ability not found"
+                if ab then ok, err = pcall(function() ab:Call("PerformAbilityForOwner") end) end
+                if not ok then
+                    log(1, "FAILED %s by %s via cco: %s", q.name, q.type, tostring(err))
+                    S.stats.failed = S.stats.failed + 1
+                end
+            end
+        end
+    end
+    -- status line (UI side, no game queries): how often each timer has fired
+    S.ui_n = (S.ui_n or 0) + 1
+    if S.canary and (S.ui_n <= 120 and S.ui_n % 4 == 0 or S.ui_n % 60 == 0) then
+        log(1, "status: ticks=%d timer calls engine=%d shared=%d canary engine=%d shared=%d",
+            S.ticks or 0, S.driver_calls.engine or 0, S.driver_calls.shared or 0, S.canary.engine, S.canary.shared)
+    end
+    -- notice when the game-clock ticks stop (game paused, or the timers died)
+    if S.last_model_clock and now - S.last_model_clock > 4 and not S.stall_logged and not S.paused then
+        S.stall_logged = true
+        log(1, "note: no game-clock tick for 4 s (the game is paused, or the game-clock timers stopped)")
+    end
+    flush_log()
 end
 
 local function register_hotkeys()
@@ -1533,13 +1825,55 @@ local function start_battle()
     S.now = 0
     log(1, "battle started: ticking every %.1fs (auto engage: %s)", cfg.tick_seconds, tostring(cfg.auto_engage))
     if S.babysitter_warning then toast("Proactive Command: disable Just Good Babysitter - both mods command idle units") end
-    bm:repeat_callback(guarded("tick", tick), math.floor(cfg.tick_seconds * 1000), "proactive_command_tick")
+    local ms = math.floor(cfg.tick_seconds * 1000)
+    -- Three independent timers call the tick; it runs once per interval (see tick). The first
+    -- calls of each are logged so a stalled timer shows up in the log.
+    local function drive(driver)
+        local n = (S.driver_calls[driver] or 0) + 1
+        S.driver_calls[driver] = n
+        if n <= 5 then
+            local ms = try(bm.time_elapsed_ms, bm)
+            log(1, "timer %s call %d: clock=%.2f game ms=%s", driver, n, clock(),
+                type(ms) == "number" and tostring(ms) or "-")
+            flush_log()
+        end
+        tick(driver)
+    end
+    -- 1) a native engine timer that calls a global function by name
+    local engine_tick = guarded("tick", function() drive("engine") end)
+    proactive_command_tick_timer = engine_tick
+    if _G then _G.proactive_command_tick_timer = engine_tick end
+    local ok_engine = pcall(function() bm:register_repeating_timer("proactive_command_tick_timer", ms) end)
+    -- 2) the game's shared script timer
+    local ok_shared = pcall(function() bm:repeat_callback(guarded("tick", function() drive("shared") end), ms, "proactive_command_tick") end)
+    -- canaries: trivial timers of both game-clock kinds that only count, to tell whether the
+    -- game stops all script timers or only ours
+    S.canary = { engine = 0, shared = 0 }
+    proactive_command_canary_timer = function() S.canary.engine = S.canary.engine + 1 end
+    if _G then _G.proactive_command_canary_timer = proactive_command_canary_timer end
+    pcall(function() bm:register_repeating_timer("proactive_command_canary_timer", ms) end)
+    pcall(function() bm:repeat_callback(function() S.canary.shared = S.canary.shared + 1 end, ms, "proactive_command_canary") end)
+    -- 3) the UI side (abilities, ability buttons, player orders) on a UI timer
+    local ui_calls = 0
+    local ok_real = pcall(function()
+        bm:repeat_real_callback(guarded("ui_step", function()
+            ui_calls = ui_calls + 1
+            if ui_calls <= 3 then log(1, "ui step %d: clock=%.2f", ui_calls, clock()) end
+            ui_step()
+        end), 500, "proactive_command_ui")
+    end)
+    log(1, "timers: game-clock engine %s, game-clock shared %s, ui %s", ok_engine and "on" or "unavailable",
+        ok_shared and "on" or "unavailable", ok_real and "on" or "unavailable")
 end
 
 local function stop_battle(reason)
     if not S.running then return end
     S.running = false
     pcall(function() bm:remove_process("proactive_command_tick") end)
+    pcall(function() bm:unregister_timer("proactive_command_tick_timer") end)
+    pcall(function() bm:remove_real_callback("proactive_command_ui") end)
+    pcall(function() bm:unregister_timer("proactive_command_canary_timer") end)
+    pcall(function() bm:remove_process("proactive_command_canary") end)
     log(1, "stopped (%s). casts=%d spells=%d failed=%d restored=%d engages=%d",
         reason, S.stats.casts, S.stats.spells, S.stats.failed, S.stats.restored, S.stats.engages)
     flush_log()
@@ -1561,13 +1895,15 @@ local function init()
         S.mp = true
         -- bm:get_player_army() is always army 1 of the alliance; in co-op the local
         -- player can be army 2+, so look the army up by the engine's local index.
-        local idx = try(bm.local_army, bm)
+        local idx = tonumber(try(bm.local_army, bm))
         local pa = try(bm.get_player_alliance, bm)
-        S.own_army = (idx and pa and try(function() return pa:armies():item(idx) end)) or try(bm.get_player_army, bm)
-        if not S.own_army then
-            log(1, "multiplayer battle: could not identify this player's army, not running"); flush_log(); return
+        local count = pa and try(function() return pa:armies():count() end) or 0
+        if not idx or idx < 1 or idx > count then
+            log(1, "multiplayer battle: could not identify this player's army (local army %s of %s), not running",
+                tostring(idx), tostring(count)); flush_log(); return
         end
-        log(1, "multiplayer battle: commanding only this player's own army (experimental)")
+        S.own_army_idx = idx
+        log(1, "multiplayer battle: commanding only this player's own army (army %d of %d in the alliance, experimental)", idx, count)
     end
     local cat, err = load_catalog()
     if not cat then
