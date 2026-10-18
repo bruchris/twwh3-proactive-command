@@ -1,15 +1,13 @@
 --------------------------------------------------------------------------------
 -- Proactive Command (Total War: WARHAMMER III battle mod)
 --
--- Your lords, heroes and units use their abilities and spells on their own, and idle
--- units (not in guard mode) pick their own targets, coordinated across the army.
--- Ability decisions use Creative Assembly's own AI ability-usage templates
--- (battle_ai_abilities_usage_* tables); one coordinator per army spends the Winds of
--- Magic; one engagement coordinator assigns targets to idle units by matchup, threat,
--- support and how much force is already committed to each enemy.
+-- Idle units (not in guard mode) pick their own fights through the game's own battle AI, so
+-- they never stand around. Auto-casting is a separate script (proactive_command_cast.lua)
+-- that has its own timers and settings; if it fails, this script is not affected.
 --
 -- Files:
---   script/battle/mod/proactive_command.lua       (this file)
+--   script/battle/mod/proactive_command.lua       (this file: idle units)
+--   script/battle/mod/proactive_command_cast.lua  (auto-cast)
 --   script/proactive_command/pc_catalog.lua       (generated from the game DB)
 -- Optional user config (plain Lua, next to Warhammer3.exe):
 --   proactive_command_config.lua   ->  return { reserve_winds = 10, ... }
@@ -17,7 +15,7 @@
 --   proactive_command_log.txt
 --------------------------------------------------------------------------------
 
-local VERSION = "0.4.0-beta.1"
+local VERSION = "0.5.0-beta.1"
 
 if proactive_command_loaded then return end
 
@@ -64,40 +62,46 @@ local DEFAULTS = {
                                       -- that player's own army (like AI General does)
     tick_seconds = 1.0,               -- how often decisions are made (battle time)
 
-    -- Who acts on their own at battle start: "off" | "abilities" | "full"
-    --   abilities = abilities, items and bound spells (no Winds of Magic)
-    --   full      = abilities + spells that cost Winds of Magic
+    -- Per-unit mode (hotkey cycles it for the selected units): "off" | "abilities" | "full".
+    -- "off" = both scripts leave the unit alone. The other two only matter to auto-cast.
     default_mode_characters = "full",
-    default_mode_units = "abilities",
+    default_mode_units = "full",
 
-    -- Decision thresholds (CA's own default min score is 0.5)
-    min_score = nil,                  -- nil = use the game's min_score_for_activation
-    score_bias = 0.0,                 -- added to every threshold; positive = more conservative
-    limited_use_extra_score = 0.1,    -- extra score needed for abilities with limited uses
-    summon_requires_threat = true,    -- only summon when enemies are close to the caster
-
-    -- Winds of Magic budget (per army)
-    min_seconds_between_spells = 4,   -- coordinator spacing between spells of one army
-    reserve_winds = 8,                -- try to keep this much in the pool...
-    reserve_bypass_score = 0.95,      -- ...unless a cast scores at least this (scores are 0..1)
-    mana_pressure = 0.2,              -- threshold rises by up to this as the pool empties
-    allow_overcast = false,           -- use "_upgraded" (overcast) versions
-    allow_miscast = false,            -- use abilities that can miscast
-
-    -- Safety
-    allow_friendly_fire = false,      -- damaging areas may not overlap your units
-    friendly_fire_margin = 12,        -- extra metres of clearance around damage areas
-    allow_targeted_while_moving = false, -- don't interrupt a moving unit with a targeted cast
-    restore_orders = true,            -- re-issue a move/attack order if a cast stopped the unit
-    skip_ai_controlled = true,        -- leave units handed to AI General / AI Army Control alone
-    allow_self_rooting = false,       -- abilities that stop the caster from moving
-    allow_transformations = false,
-    allow_summons = true,
     stop_on_victory = true,           -- stop when victory countdown starts
 
     -- Engagement: idle units that are not in guard mode find their own targets
     auto_engage = true,
+    start_grace_seconds = 15,         -- no automatic orders for this long after the battle starts
+    idle_delay = 5,                   -- a unit must have been idle this long before it picks a target
+    idle_delay_under_attack = 1.5,    -- ...or this long if it is being shot at / charged
+    release_control = true,           -- hand units back to the player after the mod's orders
+    release_delay = 1.5,              -- seconds after an order before control is handed back
+    check_script_control = true,      -- leave units alone that another script controls
+    gc_mode = "stop",                 -- "stop" = no automatic garbage collection during the battle (works around
+                                      -- the engine's script state being corrupted a moment after the first
+                                      -- tick); "default" = leave the garbage collector alone
+    gc_limit_mb = 300,                -- with gc_mode = "stop": run one full collection when memory passes this
+    -- Who chooses the targets of idle units:
+    --   "ai"  = the game's own battle AI. Idle units are handed to the engine's AI unit planner
+    --           (the system CA's scripts use for scripted enemies, and the old "delegate to AI"
+    --           button) and the AI picks and fights its own targets. Updates to CA's AI apply.
+    --   "mod" = this mod's own target scoring (the engage_* settings below)
+    engage_mode = "ai",
+    ai_order = "defend",              -- "defend": the AI holds around the unit's position and deals
+                                      -- with threats near it (retaliation)
+                                      -- "attack": the AI attacks the nearest visible enemy
+    ai_defend_radius = 120,           -- metres, for ai_order = "defend"
+    ai_hold_seconds = 15,             -- hand the unit back to you after this long without a fight
+    ai_release_after_melee = 3,       -- ...or this many seconds after it is locked in melee (it keeps fighting;
+                                      -- the AI has done its job and you can command the unit again)
+    ai_include_casters = true,        -- lords/heroes/casters too: the AI also uses their spells
+    ai_max_handovers_per_tick = 4,
     engage_min_score = 0.35,          -- how good an engagement must be (higher = more cautious)
+    engage_retaliate_bonus = 1.2,     -- extra score for an enemy that is attacking / charging this unit
+    engage_near_bonus = 1.0,          -- extra score for close targets (fades to 0 at engage_near_range)
+    engage_near_range = 130,          -- metres
+    engage_defend_first_range = 60,   -- while something is attacking this unit, targets further
+                                      -- away than this are not considered at all
     engage_radius = {                 -- max distance (m) a unit will go to find a target
         infantry = 110, anti_large = 110, cavalry = 180, monster = 140, character = 130, missile = 0,
     },                                -- missile = 0 means "within its own missile range"
@@ -108,9 +112,8 @@ local DEFAULTS = {
     engage_unlimited_from_start = false, -- also before the first contact (the army may then march
                                       -- off on its own as soon as deployment ends)
     engage_characters = true,         -- melee lords/heroes join fights on their own
-    engage_casters = false,           -- spellcasters keep their distance
+    engage_casters = true,            -- spellcaster lords/heroes also pick melee targets when idle
     engage_artillery = false,         -- artillery already fires at will
-    player_order_grace = 8,           -- seconds after you order a unit before it acts on its own
     min_hp_to_engage = 0.25,          -- badly hurt units stay out
     chase_routing_with_cavalry = true,
     ranged_melee_when_empty = false,  -- missile units without ammo stay out of melee
@@ -119,21 +122,22 @@ local DEFAULTS = {
     -- UI / logging
     hotkey_cycle_selected = "camera_bookmark_save9",   -- "Save camera bookmark 10"
     hotkey_toggle_all = "camera_bookmark_save10",      -- "Save camera bookmark 11"
+    hotkey_toggle_engage = "camera_bookmark_save8",    -- "Save camera bookmark 9": auto-engage on/off
     show_toasts = true,
     log_level = 1,                    -- 0 off, 1 casts + summary, 2 decisions, 3 debug
     log_file = "proactive_command_log.txt",
     user_config_file = "proactive_command_config.lua",
-    debug_bisect = false,             -- development: at battle start, try one kind of game query
-                                      -- per tick (logged) to find a query that stops the timers
     dev_script_path = false,          -- development: run this loose copy of the script instead
                                       -- of the packed one (read at the top of the file)
 
-    -- Per-ability overrides: never use / only use when the score is at least X
-    never_use = {},                   -- e.g. { wh_main_spell_heavens_comet_of_casandora = true }
-    min_score_override = {},          -- e.g. { wh_main_spell_fire_fireball = 0.7 }
 }
 
 local cfg = {}
+
+-- units handed to the game's AI, by either script: uid -> "engage" | "cast"
+-- (shared with proactive_command_cast.lua so the two never fight over a unit)
+PROACTIVE_COMMAND_HOLDS = PROACTIVE_COMMAND_HOLDS or {}
+local HOLDS = PROACTIVE_COMMAND_HOLDS
 for k, v in pairs(DEFAULTS) do cfg[k] = v end
 
 --------------------------------------------------------------------------------
@@ -146,21 +150,15 @@ local S = {
     paused = false,
     catalog = nil,
     units = {},         -- per unit uid: { mode, uc, next_issue, fail = {key = n}, blocked = {key = true}, statics }
-    effects = {},       -- effects[target_uid][key] = expires
-    areas = {},         -- list of { key, x, z, r, expires }
-    armies = {},        -- per army id: { last_spell, start_total, casts }
-    pending = {},       -- casts waiting for verification
-    stats = { casts = 0, spells = 0, failed = 0, restored = 0, engages = 0 },
     issuing = false,    -- true while the mod itself gives orders (ignore those in the command handler)
+    stats = { engages = 0 },
     log_buf = {},
     log_path = nil,
     next_summary = 10,
     ticks = 0,
     last_driver_ms = {},
     driver_calls = {},
-    ab_cache = {},      -- uid -> ability states read on the UI side
-    cast_queue = {},    -- button-style casts decided on the model side, pressed on the UI side
-    ui_watch = {},      -- uids whose abilities the UI side should read
+    engage_on = true,   -- auto-engage switch (hotkey)
 }
 
 --------------------------------------------------------------------------------
@@ -208,7 +206,8 @@ local function guarded(name, fn)
             seen_errors[msg] = n
             if n <= 3 then
                 log(0, "ERROR in %s: %s%s", name, msg, n == 3 and " (further repeats hidden)" or "")
-                if n == 1 and debug and debug.traceback then log(0, "%s", debug.traceback()) end
+                -- (no debug.traceback here: in the game it corrupts the script log clock and
+                -- the traceback only showed this wrapper anyway)
             end
             flush_log()
         end
@@ -290,6 +289,24 @@ local function clock()
     return (os and os.clock and os.clock()) or 0
 end
 
+-- Trace: the game's own log showed battle:time_elapsed_ms() returning a function after some
+-- engine call went wrong. This logs the first step after which that happens.
+local function chk(label)
+    if S.clock_broken then return end
+    local ms = try(bm.time_elapsed_ms, bm)
+    if type(ms) ~= "number" then
+        S.clock_broken = true
+        log(1, "TRACE: bm:time_elapsed_ms() stopped returning a number after step '%s' (got %s)", label, type(ms))
+        flush_log()
+    end
+end
+
+local function mem_mb()
+    local ok, kb = pcall(collectgarbage, "count")
+    if ok and type(kb) == "number" then return kb / 1024 end
+    return 0
+end
+
 local function cco_call(obj, expr)
     if not obj then return nil end
     local ok, r = pcall(function() return obj:Call(expr) end)
@@ -335,6 +352,7 @@ local function snapshot_unit(unit, side, player_alliance, catalog)
         type = try(unit.type, unit) or "",
         can_use_magic = try(unit.can_use_magic, unit) or false,
         guard = try(unit.is_behaviour_active, unit, "defend") or false,
+        script_ctrl = (cfg.check_script_control and try(unit.is_script_controlled, unit)) or false,
     }
     local ammo = try(unit.ammo_left, unit) or 0
     local start_ammo = try(unit.starting_ammo, unit) or 0
@@ -418,6 +436,14 @@ local function take_snapshot()
             if e.missile_unit and e.has_ammo and not e.melee then t.shot_at = true end
         end
     end
+    -- enemies that are coming for one of our units (not archers shooting from afar)
+    for _, e in ipairs(snap.enemies) do
+        local t = e.target_uid and snap.by_uid[e.target_uid]
+        if t and t.side == "friend" and not e.routing and not e.shattered
+            and not (e.missile_unit and e.has_ammo and not e.melee) and dist(e, t) < 80 then
+            t.attackers_near = (t.attackers_near or 0) + 1
+        end
+    end
     for _, f in ipairs(snap.friends) do
         local t = f.target_uid and snap.by_uid[f.target_uid]
         if t then
@@ -432,322 +458,6 @@ local function take_snapshot()
     end
     return snap
 end
-
---------------------------------------------------------------------------------
--- Scoring (CA's battle AI ability-usage templates)
---------------------------------------------------------------------------------
-
-local function count_in_area(list, x, z, r, exclude_uid)
-    local n = 0
-    for _, u in ipairs(list) do
-        if u.uid ~= exclude_uid and not u.shattered and dist_xz(u.x, u.z, x, z) <= r then
-            n = n + 1
-        end
-    end
-    return n
-end
-
-local function count_in_corridor(list, ax, az, bx, bz, width, extend)
-    local n = 0
-    for _, u in ipairs(list) do
-        if not u.shattered then
-            local d, t = seg_dist(u.x, u.z, ax, az, bx, bz)
-            if d <= width and t >= 0 and t <= extend then n = n + 1 end
-        end
-    end
-    return n
-end
-
--- Value of one template parameter for a candidate cast (raw, before multiplier)
-local function param_value(p, ctx)
-    local T, A = ctx.target, ctx.ability
-    local st = T.stats or {}
-    if p == "bool_in_melee" then
-        if A.sum then return ctx.threatened or false end   -- summons: enemies close to the caster
-        return T.melee
-    end
-    if p == "bool_out_of_melee" then return not T.melee end
-    if p == "bool_charging" then return T.charging or false end
-    if p == "bool_charged_at" or p == "bool_charging_at_me" then return T.charged_at or false end
-    if p == "bool_threatened" or p == "bool_threatening_me" then return ctx.threatened or false end
-    if p == "bool_shooting" then return T.shooting or false end
-    if p == "bool_shooting_at_me" then return T.shot_at or false end
-    if p == "bool_under_fire" then return T.under_fire end
-    if p == "bool_flying_currently" then return T.flying end
-    if p == "bool_flying_unit" then return T.can_fly end
-    if p == "bool_missile_unit" then return T.missile_unit end
-    if p == "bool_standing_still" then return not T.moving end
-    if p == "bool_ammo_under_threshold" then return T.missile_unit and T.ammo_ratio < 0.5 end
-    if p == "bool_has_abilities_costing_mana" then return T.can_use_magic end
-    if p == "bool_ability_active" then return ctx.already_active or false end
-    if p == "bool_ability_final_use" then return ctx.final_use or false end
-    if p == "bool_contesting_victory_point" or p == "bool_on_wall_near_siege_attack_focus" then return false end
-    local hp = (st.hp or 0)
-    if p == "value_armour" then return st.a or 0 end
-    if p == "value_melee_attack" then return st.ma or 0 end
-    if p == "value_melee_cp" then return (st.mcp or 0) * T.hp_frac end
-    if p == "value_missle_cp" then return (st.rcp or 0) * T.hp_frac end
-    if p == "value_total_cp" then return ((st.mcp or 0) + (st.rcp or 0)) * T.hp_frac end
-    if p == "value_num_men" then return T.men end
-    if p == "value_hitpoint_total" then return hp * T.hp_frac end
-    if p == "value_hitpoint_damage_taken" then return hp * (1 - T.hp_frac) end
-    if p == "value_morale_score" then
-        if T.routing then return 10 elseif T.wavering then return 40 end
-        return 100
-    end
-    if p == "value_speed_current" then
-        if T.moving_fast then return T.fast_speed elseif T.moving then return T.slow_speed end
-        return 0
-    end
-    if p == "value_speed_max" then return T.fast_speed end
-    if p == "value_enemy_units_in_area" then return ctx.enemies_in_area end
-    if p == "value_friendly_units_in_area" then return ctx.friends_in_area end
-    if p == "value_enemy_units_in_cone" then return ctx.enemies_in_cone end
-    if p == "value_enemy_to_friendly_ratio" then
-        return ctx.enemies_in_area / math.max(1, ctx.friends_in_area)
-    end
-    if p == "value_friendly_to_enemy_ratio" then
-        return ctx.friends_in_area / math.max(1, ctx.enemies_in_area)
-    end
-    if p == "value_winds_of_magic_amount" then return ctx.winds or 0 end
-    if p == "value_winds_of_magic_recharge" then return ctx.winds_recharge or 0 end
-    return nil -- unknown / unsupported parameter (ignored)
-end
-
--- Weighted average of normalised parameters in [0, 1]; a bool weighted 0 is a veto.
-local function template_score(template, ctx, catalog)
-    local total_w, sum = 0, 0
-    for p, w in pairs(template.w) do
-        local base, inverse = p, false
-        if string.sub(p, -8) == "_inverse" then
-            base = string.sub(p, 1, -9)
-            inverse = true
-        end
-        local raw = param_value(base, ctx)
-        if raw ~= nil then
-            local norm
-            if type(raw) == "boolean" then
-                if inverse then raw = not raw end
-                if w == 0 then
-                    if raw then return nil, "veto:" .. p end
-                else
-                    norm = raw and 1 or 0
-                end
-            else
-                local mult = catalog.params[p] or catalog.params[base] or 1
-                norm = clamp01(raw * mult)
-                if inverse then norm = 1 - norm end
-            end
-            if norm then
-                total_w = total_w + w
-                sum = sum + w * norm
-            end
-        end
-    end
-    if total_w <= 0 then return 0 end
-    return (sum / total_w) * (template.b or 1)
-end
-
---------------------------------------------------------------------------------
--- Ability classification helpers
---------------------------------------------------------------------------------
-
-local DAMAGE_TYPES = {
-    vortex = true, bombardment = true, explosion = true, wind = true, breath = true,
-    area_of_direct_damage = true, chain_direct_damage = true,
-}
-
-local function is_damaging_area(A)
-    return (A.ff and (A.rad or 0) >= 3) or DAMAGE_TYPES[A.ty] or false
-end
-
-local function is_cone(A)
-    return A.ty == "breath" or A.ty == "wind" or (A.ai and (string.find(A.ai, "breath", 1, true)
-        or string.find(A.ai, "wind", 1, true))) and true or false
-end
-
-local function area_radius(A)
-    if (A.er or 0) > 0 then return A.er end
-    if (A.rad or 0) > 0 then return A.rad end
-    return 20
-end
-
--- Range the caster can reach
-local function cast_range(A)
-    local r = A.rng or 0
-    if r < 0 then return 300 end
-    return r
-end
-
-local function self_only(A)
-    return (not A.te and not A.tf and not A.tg) or cast_range(A) <= 0
-end
-
---------------------------------------------------------------------------------
--- Candidate evaluation
---------------------------------------------------------------------------------
-
-local function friendly_fire_blocked(A, caster, tx, tz, snap)
-    if cfg.allow_friendly_fire or not A.ff or not is_damaging_area(A) then return false end
-    local margin = cfg.friendly_fire_margin or 12
-    local r = area_radius(A) + margin
-    if is_cone(A) then
-        -- corridor from the caster through the target, as long as the ability travels
-        local d = dist_xz(caster.x, caster.z, tx, tz)
-        local reach = math.max(d, cast_range(A)) + (A.vlen or 0) * 0.5
-        local ex, ez = caster.x + (tx - caster.x) / math.max(d, 1) * reach, caster.z + (tz - caster.z) / math.max(d, 1) * reach
-        for _, f in ipairs(snap.friends) do
-            if f.uid ~= caster.uid then
-                local sd, t = seg_dist(f.x, f.z, caster.x, caster.z, ex, ez)
-                if t > 0 and sd <= (A.rad or 8) + margin then return true end
-            end
-        end
-        return false
-    end
-    local px, pz -- end of a moving vortex's path (it travels away from the caster)
-    if (A.vlen or 0) > 0 then
-        local d = math.max(dist_xz(caster.x, caster.z, tx, tz), 1)
-        local len = math.min(A.vlen, 80)
-        px, pz = tx + (tx - caster.x) / d * len, tz + (tz - caster.z) / d * len
-        r = r + 5
-    end
-    for _, f in ipairs(snap.friends) do
-        if f.uid ~= caster.uid then
-            if dist_xz(f.x, f.z, tx, tz) <= r then return true end
-            if px and seg_dist(f.x, f.z, tx, tz, px, pz) <= r then return true end
-        end
-    end
-    return false
-end
-
-local function area_already_covered(key, x, z, r)
-    for _, a in ipairs(S.areas) do
-        if a.key == key and a.expires > S.now and dist_xz(a.x, a.z, x, z) < math.max(r, a.r) * 0.6 then
-            return true
-        end
-    end
-    return false
-end
-
-local function effect_active(target_uid, key)
-    local e = S.effects[target_uid]
-    return e and e[key] and e[key] > S.now
-end
-
-local function threatened(caster, snap)
-    for _, e in ipairs(snap.enemies) do
-        if not e.routing and dist(caster, e) < 60 then return true end
-    end
-    return false
-end
-
--- Returns best { score, target, x, z, reason } for one ability on one caster
-local function best_target(caster, A, key, info, army_ctx, snap)
-    local catalog = S.catalog
-    local template = catalog.templates[A.ai or ""]
-    if not template then return nil, "no AI template" end
-    local range = cast_range(A)
-    local candidates = {}
-
-    if self_only(A) or A.sum or (A.ts and not A.te and not A.tf) then
-        candidates[1] = caster
-    else
-        if A.te then
-            for _, e in ipairs(snap.enemies) do
-                if not e.routing and not e.shattered then
-                    local d = dist(caster, e)
-                    if d <= range and d >= (A.minr or 0) then candidates[#candidates + 1] = e end
-                end
-            end
-        end
-        if A.tf or A.ts then
-            for _, f in ipairs(snap.friends) do
-                if f.uid == caster.uid then
-                    if A.ts or A.sa then candidates[#candidates + 1] = f end
-                elseif A.tf and not f.routing and dist(caster, f) <= range then
-                    candidates[#candidates + 1] = f
-                end
-            end
-        end
-        if #candidates == 0 and A.tg and not A.te and not A.tf then
-            -- pure ground abilities (e.g. some area damage): aim at enemies in range
-            for _, e in ipairs(snap.enemies) do
-                if not e.routing and dist(caster, e) <= range then candidates[#candidates + 1] = e end
-            end
-        end
-    end
-    if #candidates == 0 then return nil, "no target in range" end
-
-    local radius = area_radius(A)
-    local cone = is_cone(A)
-    local best, best_reason
-    for _, T in ipairs(candidates) do
-        local ok_target = true
-        local reason
-        -- don't stack the same effect on the same target
-        if effect_active(T.uid, key) then ok_target = false; reason = "already affected" end
-        if ok_target and (A.er or 0) > 0 and area_already_covered(key, T.x, T.z, A.er) then
-            ok_target = false; reason = "area already covered"
-        end
-        if ok_target and friendly_fire_blocked(A, caster, T.x, T.z, snap) then
-            ok_target = false; reason = "friendly fire risk"
-        end
-        if ok_target then
-            local ctx = {
-                target = T, caster = caster, ability = A,
-                enemies_in_area = count_in_area(snap.enemies, T.x, T.z, radius),
-                friends_in_area = count_in_area(snap.friends, T.x, T.z, radius),
-                enemies_in_cone = 0,
-                winds = army_ctx.winds, winds_recharge = army_ctx.recharge,
-                threatened = threatened(caster, snap),
-                final_use = info.remaining == 1,
-                already_active = effect_active(T.uid, key),
-            }
-            if cone then
-                local d = math.max(dist(caster, T), 1)
-                local reach = math.max(d, range)
-                local ex = caster.x + (T.x - caster.x) / d * reach
-                local ez = caster.z + (T.z - caster.z) / d * reach
-                ctx.enemies_in_cone = count_in_corridor(snap.enemies, caster.x, caster.z, ex, ez, (A.rad or 10) + 4, 1.0)
-            end
-            if A.sum then
-                if cfg.summon_requires_threat and not ctx.threatened then
-                    ok_target = false; reason = "no threat for summon"
-                end
-            end
-            if ok_target then
-                local score, why = template_score(template, ctx, catalog)
-                if score and (not best or score > best.score) then
-                    best = { score = score, target = T, x = T.x, z = T.z }
-                    if A.sum then
-                        -- place the summon between the caster and the closest enemy
-                        local near, nd
-                        for _, e in ipairs(snap.enemies) do
-                            local d = dist(caster, e)
-                            if not nd or d < nd then near, nd = e, d end
-                        end
-                        local reach = math.min(math.max(range, 10), 25)
-                        if near and nd > 1 then
-                            best.x = caster.x + (near.x - caster.x) / nd * math.min(reach, nd * 0.5)
-                            best.z = caster.z + (near.z - caster.z) / nd * math.min(reach, nd * 0.5)
-                        end
-                        best.ground = true
-                    end
-                elseif not score then
-                    reason = why
-                end
-            end
-        end
-        best_reason = best_reason or reason
-    end
-    if not best then return nil, best_reason or "no valid target" end
-    return best
-end
-
---------------------------------------------------------------------------------
--- Live ability state via the UI context objects (same data the HUD uses)
---------------------------------------------------------------------------------
-
 local function unit_state(uid)
     local st = S.units[uid]
     if not st then
@@ -755,51 +465,6 @@ local function unit_state(uid)
         S.units[uid] = st
     end
     return st
-end
-
--- The game only allows its UI context objects (cco) to be used from the UI side (real timers,
--- UI events) and its battle model to be queried from the model side (game-clock timers,
--- phase changes). Mixing them breaks the game's script state. So ability states are read on
--- the UI side (ui_step, below) into S.ab_cache, and the model-side tick only reads that cache.
-
--- UI side only: read one unit's abilities from the UI context objects
-local function ui_read_abilities(root, uid)
-    local uc = cco_call(root, "UnitList.FirstContext(UniqueUiId == " .. tostring(uid) .. ")")
-    if not uc then return nil end
-    local entry = { at = clock(), is_character = cco_call(uc, "IsCharacter") and true or false, list = {}, by_key = {} }
-    local n = tonumber(cco_call(uc, "BattleAbilityList.Size")) or 0
-    for k = 0, n - 1 do
-        local ab = cco_call(uc, "BattleAbilityList.At(" .. k .. ")")
-        if ab then
-            local key = cco_call(ab, "SetupAbilityContext.RecordKey")
-            if key and not cco_call(ab, "SetupAbilityContext.IsPassive") then
-                local info = {
-                    key = key,
-                    can = cco_call(ab, "CanCurrentlyPerform") and true or false,
-                    active = cco_call(ab, "IsActive") and true or false,
-                    aiming = cco_call(ab, "IsCurrentlyTargetting") and true or false,
-                    targeted = cco_call(ab, "IsTargettedAbility") and true or false,
-                }
-                if cco_call(ab, "HasLimitedUses") then
-                    info.remaining = tonumber(cco_call(ab, "RemainingUses"))
-                end
-                entry.list[#entry.list + 1] = info
-                entry.by_key[key] = ab
-            end
-        end
-    end
-    return entry
-end
-
--- Model side: the most recent ability states the UI side read for this unit
--- (nil = not known yet, e.g. the UI side has not read this unit yet or the reading is stale)
-local function read_abilities(u, st)
-    local c = S.ab_cache[u.uid]
-    if not c then return nil end
-    st.is_character = c.is_character
-    u.is_character = c.is_character
-    if clock() - c.at > 3 then return nil end
-    return c.list
 end
 
 --------------------------------------------------------------------------------
@@ -820,16 +485,28 @@ local function unit_mode(u, st)
 end
 
 local function claimed_by_other_mod(u)
+    if HOLDS[u.uid] == "cast" then return true end   -- held by the auto-cast script
     if not cfg.skip_ai_controlled then return false end
     if modder_API_uc_manager and type(modder_API_uc_manager.is_unit_claimed) == "function" then
         local ok, owner = pcall(modder_API_uc_manager.is_unit_claimed, modder_API_uc_manager, tostring(u.uid))
         if ok and owner then return true end
     end
+    -- under script control that is not ours (we hand units back shortly after our own orders)
+    if u.script_ctrl and not (S.units[u.uid] and S.units[u.uid].ai) then
+        local st = S.units[u.uid]
+        if not st or not st.uc or S.now - (st.last_order_at or -100) > 6 then
+            if st and not st.skip_logged then
+                st.skip_logged = true
+                log(1, "leaving %s alone: it is under script control that is not ours", u.type)
+            end
+            return true
+        end
+    end
     return false
 end
 
 --------------------------------------------------------------------------------
--- Casting
+-- Unit control: orders and handing units back
 --------------------------------------------------------------------------------
 
 local function get_uc(u, st)
@@ -841,248 +518,28 @@ local function get_uc(u, st)
     return uc
 end
 
-local function record_effect(A, key, cand)
-    local dur = (A.dur or 0) > 0 and A.dur or 10
-    local T = cand.target
-    S.effects[T.uid] = S.effects[T.uid] or {}
-    S.effects[T.uid][key] = S.now + dur
-    local r = area_radius(A)
-    S.areas[#S.areas + 1] = { key = key, x = cand.x, z = cand.z, r = r, expires = S.now + dur }
+-- A unit controller takes the unit away from the player while it holds control (the card is
+-- greyed out). So every order the mod gives is followed, a moment later, by handing the unit back.
+local function schedule_release(st, delay)
+    st.last_order_at = S.now
+    if not cfg.release_control then return end
+    local at = S.now + (delay or cfg.release_delay or 1.5)
+    if not st.release_at or at > st.release_at then st.release_at = at end
 end
 
-local function issue(u, st, info, A, cand)
-    local key = info.key
-    local T = cand.target
-    local before = {
-        moving = u.moving, moving_fast = u.moving_fast,
-        target = u.target_uid and try(u.unit.current_target, u.unit) or nil,
-        pos = try(u.unit.ordered_position, u.unit),
-        bearing = try(u.unit.ordered_bearing, u.unit),
-        width = try(u.unit.ordered_width, u.unit),
-    }
-    local method
-    local ok, err
-    if not info.targeted then
-        -- the ability button lives in the UI: the UI side presses it (ui_step)
-        method = "cco"
-        S.cast_queue[#S.cast_queue + 1] = { uid = u.uid, key = key, name = A.n or key, type = u.type, at = clock() }
-        ok = true
-    else
-        local uc = get_uc(u, st)
-        local unit_target = not cand.ground and T.unit and (
-            (T.side == "enemy" and A.te) or
-            (T.side == "friend" and T.uid ~= u.uid and A.tf) or
-            (T.uid == u.uid and (A.ts or A.tf)))
-        S.issuing = true
-        if unit_target then
-            method = "uc"
-            ok, err = pcall(function() uc:perform_special_ability(key, T.unit) end)
-        else
-            method = "uc_ground"
-            ok, err = pcall(function()
-                local y = T.unit and T.unit:position():get_y() or 0
-                uc:perform_special_ability_ground(key, vec(cand.x, y, cand.z))
-            end)
-        end
-        S.issuing = false
-    end
-    if not ok then
-        st.fail[key] = (st.fail[key] or 0) + 1
-        log(1, "FAILED %s (%s) by %s via %s: %s", A.n or key, key, u.type, method, tostring(err))
-        S.stats.failed = S.stats.failed + 1
-        return false
-    end
-    record_effect(A, key, cand)
-    S.stats.casts = S.stats.casts + 1
-    if (A.mana or 0) > 0 then S.stats.spells = S.stats.spells + 1 end
-    st.next_issue = S.now + math.max(1.5, (A.wu or 0) + 0.5)
-    S.pending[#S.pending + 1] = {
-        uid = u.uid, key = key, at = S.now, check_at = S.now + (A.wu or 0) + 1.5,
-        before = before, method = method, name = A.n or key,
-    }
-    log(1, "CAST %-28s by %-36s -> %s %s score=%.2f mana=%s via %s",
-        A.n ~= "" and A.n or key, u.type, T.side == "enemy" and "enemy" or (T.uid == u.uid and "self" or "ally"),
-        T.type or "", cand.score or 0, tostring(A.mana or 0), method)
-    return true
-end
-
-local function verify_pending(snap)
-    local keep = {}
-    for _, p in ipairs(S.pending) do
-        if S.now < p.check_at then
-            keep[#keep + 1] = p
-        else
-            local u = snap.by_uid[p.uid]
-            local st = S.units[p.uid]
-            local abilities = u and st and read_abilities(u, st)
-            if u and st and not abilities and S.now < p.check_at + 5 then
-                keep[#keep + 1] = p   -- ability states not read yet: check again next tick
-            elseif u and st and abilities then
-                local fired = false
-                for _, info in ipairs(abilities) do
-                    if info.key == p.key then
-                        fired = info.active or not info.can
-                    end
-                end
-                if not fired then
-                    st.fail[p.key] = (st.fail[p.key] or 0) + 1
-                    log(1, "NO EFFECT %s by %s via %s (attempt %d)", p.name, u.type, p.method, st.fail[p.key])
-                    if st.fail[p.key] >= 3 then
-                        st.blocked[p.key] = true
-                        log(1, "  -> disabling %s for this unit for the rest of the battle", p.key)
-                    end
-                else
-                    st.fail[p.key] = 0
-                end
-                -- give the player's last order back if the cast stopped the unit
-                if cfg.restore_orders and p.method ~= "cco" and u.idle and not u.melee then
-                    S.issuing = true
-                    local b = p.before
-                    local uc = st.uc
-                    if uc and b.target and (try(b.target.number_of_men_alive, b.target) or 0) > 0 then
-                        if pcall(function() uc:attack_unit(b.target, true, b.moving_fast) end) then
-                            S.stats.restored = S.stats.restored + 1
-                            log(2, "  restored attack order for %s", u.type)
-                        end
-                    elseif uc and b.moving and b.pos and dist_xz(b.pos:get_x(), b.pos:get_z(), u.x, u.z) > 8 then
-                        if pcall(function() uc:goto_location_angle_width(b.pos, b.bearing or 0, b.width or 20, b.moving_fast) end) then
-                            S.stats.restored = S.stats.restored + 1
-                            log(2, "  restored move order for %s", u.type)
-                        end
-                    end
-                    S.issuing = false
-                end
-            end
-        end
-    end
-    S.pending = keep
-end
-
---------------------------------------------------------------------------------
--- Per-army decision making
---------------------------------------------------------------------------------
-
-local function base_threshold(A, key)
-    local t = cfg.min_score or (S.catalog.kv.min_score_for_activation or 0.5)
-    t = t + (cfg.score_bias or 0)
-    if A.uses then t = t + (cfg.limited_use_extra_score or 0) end
-    local o = cfg.min_score_override and cfg.min_score_override[key]
-    if o then t = o end
-    return t
-end
-
-local function allowed(A, key, mode, st)
-    if mode == "off" then return false, "mode off" end
-    if (A.mana or 0) > 0 and mode ~= "full" then return false, "spells disabled" end
-    if st.blocked[key] then return false, "blocked after failures" end
-    if cfg.never_use and cfg.never_use[key] then return false, "never_use" end
-    if A.upg and not cfg.allow_overcast then return false, "overcast" end
-    if (A.mc or 0) > 0 and not cfg.allow_miscast then return false, "miscast risk" end
-    if A.tr and not cfg.allow_transformations then return false, "transformation" end
-    if A.fm then return false, "formation/stance" end
-    if A.sum and not cfg.allow_summons then return false, "summons disabled" end
-    if A.cm and not cfg.allow_self_rooting then return false, "roots caster" end
-    if A.src == "cataclysm" then return false, "cataclysm" end
-    return true
-end
-
-local function process_army(pa, snap)
-    local army = pa.army
-    local aid = pa.key or "army"
-    local actx = S.armies[aid]
-    if not actx then
-        actx = { last_spell = -100, max_pool = 0, casts = 0 }
-        S.armies[aid] = actx
-    end
-    actx.winds = try(army.winds_of_magic_current, army) or 0
-    actx.reserve = try(army.winds_of_magic_reserve, army) or 0
-    actx.recharge = try(army.winds_of_magic_remaining_recharge_rate, army) or 0
-    if actx.winds > actx.max_pool then actx.max_pool = actx.winds end
-
-    local spell_candidates = {}
-    for _, u in ipairs(pa.units) do
-        local st = unit_state(u.uid)
-        local mode = unit_mode(u, st)
-        if mode ~= "off" and not u.routing and not u.shattered and S.now >= st.next_issue
-            and S.now >= st.idle_until and not claimed_by_other_mod(u) then
-            local abilities = read_abilities(u, st) or {}
-            local known = false
-            for _, info in ipairs(abilities) do
-                if S.catalog.abilities[info.key] then known = true end
-            end
-            if not known and S.ab_cache[u.uid] then st.idle_until = S.now + 10 end  -- nothing to do; look again later
-            local player_aiming = false
-            for _, info in ipairs(abilities) do
-                if info.aiming then player_aiming = true end
-            end
-            if mode ~= "off" and not player_aiming then
-                local issued = false
-                for _, info in ipairs(abilities) do
-                    local A = S.catalog.abilities[info.key]
-                    if A and info.can and not info.active and not issued then
-                        local ok_use, why = allowed(A, info.key, mode, st)
-                        if ok_use and info.targeted and u.moving and not u.melee
-                            and not cfg.allow_targeted_while_moving and (A.wu or 0) > 0 then
-                            ok_use, why = false, "unit is moving"
-                        end
-                        if ok_use then
-                            local cand, why2 = best_target(u, A, info.key, info, actx, snap)
-                            local thr = base_threshold(A, info.key)
-                            if cand then
-                                if (A.mana or 0) > 0 then
-                                    cand.u, cand.st, cand.info, cand.A, cand.thr = u, st, info, A, thr
-                                    spell_candidates[#spell_candidates + 1] = cand
-                                elseif cand.score >= thr then
-                                    issued = issue(u, st, info, A, cand)
-                                else
-                                    log(3, "skip %s (%s): score %.2f < %.2f", info.key, u.type, cand.score, thr)
-                                end
-                            else
-                                log(3, "skip %s (%s): %s", info.key, u.type, tostring(why2))
-                            end
-                        else
-                            log(3, "skip %s (%s): %s", info.key, u.type, tostring(why))
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    -- One spell per army per window: pick the best, respecting the Winds of Magic budget
-    if #spell_candidates > 0 and S.now - actx.last_spell >= (cfg.min_seconds_between_spells or 0) then
-        local cap = math.max(actx.max_pool, 1)
-        local fill = clamp01(actx.winds / cap)
-        local kv = S.catalog.kv
-        local pressure = (cfg.mana_pressure or 0) * (1 - fill)
-        if fill < (kv.mana_saving_threshold or 0.1) then
-            pressure = pressure + (kv.mana_saving_max_added_amount or 0.15)
-        end
-        table.sort(spell_candidates, function(a, b)
-            local ma, mb = a.score - a.thr, b.score - b.thr
-            if math.abs(ma - mb) > 0.03 then return ma > mb end
-            return (a.A.mana or 0) < (b.A.mana or 0)
-        end)
-        for _, c in ipairs(spell_candidates) do
-            local need = c.thr + pressure
-            local after = actx.winds - (c.A.mana or 0)
-            local reserve_ok = after >= (cfg.reserve_winds or 0) or c.score >= (cfg.reserve_bypass_score or 1)
-            if c.score >= need and reserve_ok and after >= 0 then
-                if issue(c.u, c.st, c.info, c.A, c) then
-                    actx.last_spell = S.now
-                    actx.casts = actx.casts + 1
-                    log(2, "  winds %.1f -> ~%.1f (reserve pool %.1f), threshold %.2f", actx.winds, after, actx.reserve, need)
-                    break
-                end
-            else
-                log(2, "hold %s (%s): score %.2f need %.2f, winds %.1f-%.1f, reserve_ok=%s",
-                    c.A.n or c.info.key, c.u.type, c.score, need, actx.winds, c.A.mana or 0, tostring(reserve_ok))
+local function release_due()
+    for _, st in pairs(S.units) do
+        if st.release_at and S.now >= st.release_at then
+            st.release_at = nil
+            if st.uc then
+                local ok, err = pcall(function() st.uc:release_control() end)
+                st.released_at = S.now
+                st.release_check = S.now + 2
+                if not ok then log(1, "release_control failed: %s", tostring(err)) end
             end
         end
     end
 end
-
-
 --------------------------------------------------------------------------------
 -- Engagement: coordinated target assignment for idle units
 --
@@ -1136,7 +593,8 @@ local function engage_radius(u, r)
         if m <= 0 then return (u.missile_range or 0) + 5 end
         return m
     end
-    if unlimited_reach() then return math.huge end
+    -- NOTE: math.huge does not exist in the game's Lua sandbox (it is nil there), so use a big number
+    if unlimited_reach() then return 1e9 end
     return radii[r] or 110
 end
 
@@ -1230,11 +688,29 @@ local function engage_score(f, fr, e, ctx, snap)
         if e.routing then score = score * 0.3 end
     else
         local big_f, big_e = is_large(f), is_large(e)
+        -- Retaliate first: an enemy that is attacking / charging this unit is the target, and
+        -- while one is on its way nothing far away is worth running off to.
+        local attacking_me = e.target_uid == f.uid and not e.routing
+            and not (e.missile_unit and e.has_ammo and not e.melee)
+        if attacking_me then
+            score = score + (cfg.engage_retaliate_bonus or 1.2); tags[#tags + 1] = "retaliate"
+        elseif (f.attackers_near or 0) > 0 and d > (cfg.engage_defend_first_range or 60) then
+            return nil
+        end
+        -- spellcaster lords/heroes never go hunting: they only hit back at what attacks them,
+        -- or at something right next to them
+        if fr == "caster" and not attacking_me and d > 30 then return nil end
+        -- closer targets are better, always (also with unlimited reach)
+        local near_range = cfg.engage_near_range or 130
+        if d < near_range then
+            score = score + (cfg.engage_near_bonus or 1.0) * (1 - d / near_range)
+        end
         -- matchups
         if anti_large(f) and big_e then score = score + 0.8; tags[#tags + 1] = "anti-large" end
         if big_f and anti_large(e) and not ctx.pinned[e.uid] then score = score - 0.7; tags[#tags + 1] = "spears!" end
         if (fr == "cavalry" or fr == "monster" or fr == "character") and (er == "missile" or er == "artillery" or er == "caster") then
-            score = score + 0.7; tags[#tags + 1] = "hunt soft"
+            -- (worth less the longer it takes to get there)
+            score = score + 0.7 * clamp01(25 / math.max(ttr, 1)); tags[#tags + 1] = "hunt soft"
         end
         if (fr == "cavalry" or fr == "monster") and ctx.pinned[e.uid] then
             score = score + 0.6 * clamp01(25 / math.max(ttr, 1)); tags[#tags + 1] = "flank pinned"
@@ -1287,38 +763,210 @@ local function engage_score(f, fr, e, ctx, snap)
     -- travel time (steep for the first 15 s, then flatter so distant but needed fights still happen)
     local travel = 0.02 * math.min(ttr, 15) + 0.005 * math.max(0, ttr - 15)
     -- with unlimited reach, nearer targets are still preferred, but distance alone never rules one out
-    if unlimited_reach() then travel = math.min(travel, 0.3) end
+    if unlimited_reach() then travel = math.min(travel, 0.5) end
     score = score - travel
     return score, table.concat(tags, ",")
 end
 
 local function is_free(u, st)
-    if not u.idle or u.melee or u.routing or u.shattered or u.wavering or u.guard then return false end
+    if st.ai or HOLDS[u.uid] then return false end
+    -- Only units that are idle (no order at all) ever get an automatic order. A unit that is
+    -- moving, fighting or carrying out any order is never touched.
+    if not u.idle or u.melee or u.moving or u.routing or u.shattered or u.wavering or u.guard then return false end
     if u.hp_frac < (cfg.min_hp_to_engage or 0.25) then return false end
     if S.now < (st.next_issue or 0) then return false end
-    if S.now - (st.player_order_at or -100) < (cfg.player_order_grace or 8) then return false end
     if S.now - (st.engaged_at or -100) < 3 then return false end
+    -- it must have been idle for a while (the player may have just stopped it on purpose);
+    -- units that are being shot at or charged don't wait as long
+    local need = (u.under_fire or u.charged_at) and (cfg.idle_delay_under_attack or 1.5) or (cfg.idle_delay or 5)
+    if S.now - (st.idle_since or S.now) < need then return false end
+    return true
+end
+--------------------------------------------------------------------------------
+-- Engagement through the game's own AI (engage_mode = "ai")
+--
+-- The engine's AI unit planner is the system CA's scripts use to play units "under AI control"
+-- (see script/_lib/lib_battle_script_ai_planner.lua). A unit given to it is played by the
+-- battle AI: it chooses and fights its own targets and, like enemy AI units, uses its spells
+-- and abilities. We hand idle units over, wait, and give them back to the player.
+--------------------------------------------------------------------------------
+
+local function ai_position(u)
+    local pos = try(u.unit.position, u.unit)
+    return pos or vec(u.x, 0, u.z)
+end
+
+local function ai_hand_over(u, st)
+    local ok, err = pcall(function()
+        local alliance = u.unit:army():alliance()
+        local planner = alliance:create_ai_unit_planner()
+        planner:add_units(u.unit)
+        st.ai = { planner = planner, state = "added", at = S.now }
+        HOLDS[u.uid] = "engage"
+    end)
+    st.engaged_at = S.now
+    if not ok then
+        st.ai = nil
+        HOLDS[u.uid] = nil
+        st.ai_failed = (st.ai_failed or 0) + 1
+        log(1, "AI HANDOVER FAILED %s: %s", u.type, tostring(err))
+        if st.ai_failed >= 2 then st.mode = "off"; log(1, "  -> leaving %s alone", u.type) end
+        return false
+    end
+    S.stats.engages = S.stats.engages + 1
+    log(1, "AI HANDOVER %s -> game AI (%s)", u.type, cfg.ai_order or "defend")
     return true
 end
 
-local function run_engagement(snap)
-    if not cfg.auto_engage then return end
-    local free = {}
-    for _, pa in ipairs(snap.player_armies) do
-        for _, u in ipairs(pa.units) do
-            local st = unit_state(u.uid)
-            if unit_mode(u, st) ~= "off" and is_free(u, st) and not claimed_by_other_mod(u) then
-                local r = role(u)
-                local ok = true
-                if r == "artillery" and not cfg.engage_artillery then ok = false end
-                if r == "caster" and not cfg.engage_casters then ok = false end
-                if r == "character" and not cfg.engage_characters then ok = false end
-                if r == "missile" and not u.has_ammo and not cfg.ranged_melee_when_empty then ok = false end
-                if r == "missile" and not u.has_ammo and cfg.ranged_melee_when_empty then r = "infantry" end
-                if ok then free[#free + 1] = { u = u, st = st, role = r } end
+local function ai_release(u, st, why)
+    local ai = st.ai
+    if not ai then return end
+    HOLDS[u.uid] = nil
+    pcall(function() ai.planner:remove_units(u.unit) end)
+    pcall(function()
+        local uc = get_uc(u, st)
+        uc:release_control()
+    end)
+    st.ai = nil
+    st.engaged_at = S.now
+    st.next_issue = S.now + 1
+    log(1, "AI RELEASE %s back to you (%s)", u.type, why)
+end
+
+-- every tick: give pending orders (CA waits a moment after adding a unit), hand units back
+local function ai_manage(snap)
+    for uid, st in pairs(S.units) do
+        local ai = st.ai
+        if ai then
+            local u = snap.by_uid[uid]
+            if not u then
+                st.ai = nil   -- unit is gone
+                HOLDS[uid] = nil
+            elseif ai.state == "added" and S.now - ai.at >= 1 then
+                local ok, err = pcall(function()
+                    pcall(function() get_uc(u, st):release_control() end)
+                    if (cfg.ai_order or "defend") == "attack" then
+                        local best, bd
+                        for _, e in ipairs(snap.enemies) do
+                            if not e.routing and not e.shattered then
+                                local d = dist(u, e)
+                                if not bd or d < bd then best, bd = e, d end
+                            end
+                        end
+                        if best then ai.planner:attack_unit(best.unit)
+                        else ai.planner:defend_position(ai_position(u), cfg.ai_defend_radius or 120) end
+                    else
+                        ai.planner:defend_position(ai_position(u), cfg.ai_defend_radius or 120)
+                    end
+                end)
+                ai.state = "active"
+                ai.ordered_at = S.now
+                if not ok then
+                    log(1, "AI ORDER FAILED %s: %s", u.type, tostring(err))
+                    ai_release(u, st, "order failed")
+                end
+            elseif ai.state == "active" then
+                S.ai_status_logged = (S.ai_status_logged or 0) + 1
+                if S.ai_status_logged <= 6 then
+                    log(1, "AI status: %s script_ctrl=%s idle=%s moving=%s melee=%s", u.type,
+                        tostring(u.script_ctrl), tostring(u.idle), tostring(u.moving), tostring(u.melee))
+                end
+                if u.melee then ai.melee_since = ai.melee_since or S.now else ai.melee_since = nil end
+                if u.routing or u.shattered then
+                    ai_release(u, st, "unit is routing")
+                elseif ai.melee_since and S.now - ai.melee_since >= (cfg.ai_release_after_melee or 3) then
+                    ai_release(u, st, "it is fighting now")
+                elseif not u.melee and S.now - (ai.ordered_at or ai.at) >= (cfg.ai_hold_seconds or 15) then
+                    ai_release(u, st, "hold time over")
+                end
             end
         end
     end
+end
+
+local function run_ai_engagement(snap)
+    local n = 0
+    for _, pa in ipairs(snap.player_armies) do
+        for _, u in ipairs(pa.units) do
+            local st = unit_state(u.uid)
+            local r = role(u)
+            local why
+            if unit_mode(u, st) == "off" then why = "mode off"
+            elseif claimed_by_other_mod(u) then why = "script/AI controlled"
+            elseif st.ai then why = "with the game AI"
+            elseif not is_free(u, st) then
+                if not u.idle then why = "not idle"
+                elseif u.melee then why = "in melee"
+                elseif u.moving then why = "moving"
+                elseif u.guard then why = "guard mode"
+                elseif (u.hp_frac or 1) < (cfg.min_hp_to_engage or 0) then why = "too hurt"
+                elseif st.idle_since and (S.now - st.idle_since) < (cfg.idle_delay or 0) then why = "idle delay"
+                else why = "not free"
+                end
+            elseif r == "artillery" and not cfg.engage_artillery then why = "artillery left alone"
+            elseif (r == "caster" or r == "character") and cfg.ai_include_casters == false then why = "lords/heroes left alone"
+            elseif r == "missile" and not u.has_ammo and not cfg.ranged_melee_when_empty then why = "no ammo"
+            end
+            if why ~= st.skip_reason then
+                st.skip_reason = why
+                if why and why ~= "with the game AI" then log(1, "engage skip %s (%s): %s", u.type, r, why) end
+            end
+            if not why and n < (cfg.ai_max_handovers_per_tick or 4) and #snap.enemies > 0 then
+                if ai_hand_over(u, st) then n = n + 1 end
+            end
+        end
+    end
+end
+
+local function run_engagement(snap)
+    if not cfg.auto_engage or not S.engage_on then
+        -- switched off (hotkey): give every unit the game AI is playing back to the player
+        for uid, st in pairs(S.units) do
+            local u = st.ai and snap.by_uid[uid]
+            if u then ai_release(u, st, "auto-engage switched off") end
+        end
+        return
+    end
+    if S.now < (cfg.start_grace_seconds or 0) then return end   -- grace period after the battle starts
+    if cfg.engage_mode == "ai" then
+        ai_manage(snap)
+        run_ai_engagement(snap)
+        return
+    end
+    local free = {}
+    local explain = not S.engage_explain_logged and S.now >= (cfg.start_grace_seconds or 0)
+    for _, pa in ipairs(snap.player_armies) do
+        for _, u in ipairs(pa.units) do
+            local st = unit_state(u.uid)
+            local r = role(u)
+            local why
+            if unit_mode(u, st) == "off" then why = "mode off"
+            elseif claimed_by_other_mod(u) then why = "script/AI controlled"
+            elseif not is_free(u, st) then
+                if not u.idle then why = "not idle"
+                elseif u.melee then why = "in melee"
+                elseif u.moving then why = "moving"
+                elseif u.guard then why = "guard mode"
+                elseif (u.hp_frac or 1) < (cfg.min_hp_to_engage or 0) then why = "too hurt"
+                elseif st.idle_since and (S.now - st.idle_since) < (cfg.idle_delay or 0) then why = "idle delay"
+                else why = "not free"
+                end
+            else
+                local ok = true
+                if r == "artillery" and not cfg.engage_artillery then ok, why = false, "artillery left alone" end
+                if r == "caster" and not cfg.engage_casters then ok, why = false, "caster (engage_casters off)" end
+                if r == "character" and not cfg.engage_characters then ok, why = false, "character (engage_characters off)" end
+                if r == "missile" and not u.has_ammo and not cfg.ranged_melee_when_empty then ok, why = false, "no ammo" end
+                if r == "missile" and not u.has_ammo and cfg.ranged_melee_when_empty then r = "infantry" end
+                if ok then free[#free + 1] = { u = u, st = st, role = r } end
+            end
+            if why ~= st.skip_reason and S.now >= (cfg.start_grace_seconds or 0) then
+                st.skip_reason = why
+                if why then log(1, "engage skip %s (%s): %s", u.type, r, why) end
+            end
+        end
+    end
+    if explain then S.engage_explain_logged = true end
     if #free == 0 or #snap.enemies == 0 then return end
     log(3, "engage: %d free unit(s), %d visible enemies", #free, #snap.enemies)
 
@@ -1398,6 +1046,26 @@ local function run_engagement(snap)
         end
     end
 
+    -- units that were free but found nothing worth doing: say so now and then
+    for _, fu in ipairs(remaining) do
+        local assigned = false
+        for _, p in ipairs(plan) do if p.fu == fu then assigned = true end end
+        if not assigned and S.now - (fu.st.noassign_logged or -100) >= 15 then
+            fu.st.noassign_logged = S.now
+            local top_s, top_e
+            for _, e in ipairs(snap.enemies) do
+                local sc = engage_score(fu.u, fu.role, e, base_ctx, snap)
+                if sc and (not top_s or sc > top_s) then top_s, top_e = sc, e end
+            end
+            if top_s then
+                log(1, "engage: %s (%s) is idle but nothing is good enough (best %s %.2f < %.2f)",
+                    fu.u.type, fu.role, top_e.type, top_s, min_score)
+            else
+                log(1, "engage: %s (%s) is idle but has no valid target (none in reach / allowed)", fu.u.type, fu.role)
+            end
+        end
+    end
+
     -- 3) give the orders
     for _, p in ipairs(plan) do
         local f, e = p.fu.u, p.e
@@ -1411,6 +1079,8 @@ local function run_engagement(snap)
             p.fu.st.engaged_target = e.uid
             p.fu.st.engaged_at = S.now
             S.stats.engages = S.stats.engages + 1
+            schedule_release(p.fu.st, cfg.release_delay)
+            chk("engage order")
             log(1, "ENGAGE %-34s -> %-34s score=%.2f %s", f.type, e.type, p.score, p.why ~= "" and ("(" .. p.why .. ")") or "")
         else
             log(1, "ENGAGE FAILED %s -> %s: %s", f.type, e.type, tostring(err))
@@ -1419,170 +1089,40 @@ local function run_engagement(snap)
     end
 end
 
--- Player orders: give the player's units a grace period before acting on their own
-local PLAYER_COMMANDS = { "Move", "Move Orientation Width", "Move Rotation Angle", "Halt", "Withdraw",
-    "Attack", "Attack Unit", "Attack Building", "Attack Position", "Melee Mode", "Skirmish", "Fire At Will" }
-
-local function on_player_command()
-    -- runs on the model side: just note the time; the UI side looks up which units were
-    -- selected (ui_step) and gives them the grace period
-    if S.issuing then return end
-    S.player_cmd_pending = S.now
-end
-
-local function register_command_watch()
-    for _, c in ipairs(PLAYER_COMMANDS) do
-        pcall(function()
-            bm:unregister_command_handler_callback(c, "proactive_command_orders")
-        end)
-        pcall(function()
-            bm:register_command_handler_callback(c, guarded("player_command", on_player_command), "proactive_command_orders")
-        end)
-    end
-end
+-- Player orders are never overridden: the mod only gives orders to units that are idle (no
+-- order at all, see is_free) and it hands every unit back to the player after its own orders.
 
 --------------------------------------------------------------------------------
 -- Main loop
 --------------------------------------------------------------------------------
 
-local function prune()
-    local keep = {}
-    for _, a in ipairs(S.areas) do
-        if a.expires > S.now then keep[#keep + 1] = a end
-    end
-    S.areas = keep
-end
-
--- Development aid (debug_bisect): one kind of game query per tick, each logged before and
--- after, so if the game's timers stop, the last logged step shows which query preceded it.
-local function bisect_units(fn)
-    local n = 0
-    local function each_alliance(al, own)
-        local armies = al:armies()
-        for i = 1, armies:count() do
-            local army = armies:item(i)
-            if not own or army:is_player_controlled() then
-                local units = army:units()
-                for j = 1, units:count() do fn(units:item(j), army, al); n = n + 1 end
+-- Per tick bookkeeping for the player's units: how long each has been idle, and a check that
+-- units we handed back are really back (and kept the order we gave them).
+local function track_units(snap)
+    for _, pa in ipairs(snap.player_armies) do
+        for _, u in ipairs(pa.units) do
+            local st = unit_state(u.uid)
+            if u.idle and not u.melee and not u.moving then
+                st.idle_since = st.idle_since or S.now
+            else
+                st.idle_since = nil
+            end
+            if st.release_check and S.now >= st.release_check then
+                st.release_check = nil
+                if u.script_ctrl then
+                    S.warn_release = (S.warn_release or 0) + 1
+                    if S.warn_release <= 3 then
+                        log(1, "WARNING: %s is still script-controlled 2 s after release_control; the player may not be able to command it", u.type)
+                    end
+                elseif u.idle and not u.melee and st.engaged_at and S.now - st.engaged_at < 7 then
+                    S.warn_lost = (S.warn_lost or 0) + 1
+                    if S.warn_lost <= 3 then
+                        log(1, "NOTE: %s went idle right after its unit was handed back (was the order lost?)", u.type)
+                    end
+                end
             end
         end
     end
-    each_alliance(bm:get_player_alliance(), true)
-    each_alliance(bm:get_non_player_alliance(), false)
-    return n
-end
-local function unit_call(name, ...)
-    local args = { ... }
-    return function() return bisect_units(function(u) local f = u[name]; if f then f(u, unpack(args)) end end) end
-end
-local BISECT = {
-    { "nothing (heartbeat only)", function() return 0 end },
-    { "alliances, armies, unit lists", function() return bisect_units(function() end) end },
-    { "unique_ui_id", unit_call("unique_ui_id") },
-    { "number_of_men_alive", unit_call("number_of_men_alive") },
-    { "position", function() return bisect_units(function(u) local p = u:position(); local _ = p:get_x() + p:get_z() end) end },
-    { "unary_hitpoints", unit_call("unary_hitpoints") },
-    { "is_in_melee", unit_call("is_in_melee") },
-    { "is_moving", unit_call("is_moving") },
-    { "is_moving_fast", unit_call("is_moving_fast") },
-    { "is_idle", unit_call("is_idle") },
-    { "is_routing", unit_call("is_routing") },
-    { "is_crumbling", unit_call("is_crumbling") },
-    { "is_unstable", unit_call("is_unstable") },
-    { "is_shattered", unit_call("is_shattered") },
-    { "is_wavering", unit_call("is_wavering") },
-    { "is_currently_flying", unit_call("is_currently_flying") },
-    { "can_fly", unit_call("can_fly") },
-    { "is_under_missile_attack", unit_call("is_under_missile_attack") },
-    { "fast_speed", unit_call("fast_speed") },
-    { "slow_speed", unit_call("slow_speed") },
-    { "type", unit_call("type") },
-    { "can_use_magic", unit_call("can_use_magic") },
-    { "is_behaviour_active(defend)", unit_call("is_behaviour_active", "defend") },
-    { "ammo_left", unit_call("ammo_left") },
-    { "starting_ammo", unit_call("starting_ammo") },
-    { "missile_range", unit_call("missile_range") },
-    { "current_target", unit_call("current_target") },
-    { "is_leaving_battle", unit_call("is_leaving_battle") },
-    { "is_valid_target", unit_call("is_valid_target") },
-    { "is_visible_to_alliance (enemies)", function()
-        local pa = bm:get_player_alliance()
-        return bisect_units(function(u, army, al) if al ~= pa and u.is_visible_to_alliance then u:is_visible_to_alliance(pa) end end)
-    end },
-    { "reinforcement units", function()
-        local n = 0
-        for _, al in ipairs({ bm:get_player_alliance(), bm:get_non_player_alliance() }) do
-            local armies = al:armies()
-            for i = 1, armies:count() do
-                local army = armies:item(i)
-                local k = army.num_reinforcement_units and army:num_reinforcement_units() or 0
-                for r = 1, k do local c = army:get_reinforcement_units(r); n = n + (c and c:count() or 0) end
-            end
-        end
-        return n
-    end },
-    { "army winds of magic", function()
-        local armies = bm:get_player_alliance():armies()
-        for i = 1, armies:count() do
-            local a = armies:item(i)
-            if a.winds_of_magic_current then a:winds_of_magic_current() end
-            if a.winds_of_magic_reserve then a:winds_of_magic_reserve() end
-        end
-        return armies:count()
-    end },
-    { "full snapshot", function() local snap = take_snapshot(); return #snap.friends + #snap.enemies end },
-    { "army unique_id (old code)", function()
-        local armies = bm:get_player_alliance():armies()
-        for i = 1, armies:count() do local a = armies:item(i); if a.unique_id then a:unique_id() end end
-        return armies:count()
-    end },
-    { "is_ai_controlled (old code)", unit_call("is_ai_controlled") },
-    { "ordered_position / bearing / width", function()
-        local n = 0
-        local armies = bm:get_player_alliance():armies()
-        for i = 1, armies:count() do
-            local units = armies:item(i):units()
-            for j = 1, units:count() do
-                local u = units:item(j)
-                if u.ordered_position then u:ordered_position() end
-                if u.ordered_bearing then u:ordered_bearing() end
-                if u.ordered_width then u:ordered_width() end
-                n = n + 1
-            end
-        end
-        return n
-    end },
-    { "unit:army() + create_unit_controller (one unit, no orders)", function()
-        local u = bm:get_player_alliance():armies():item(1):units():item(1)
-        local uc = u:army():create_unit_controller()
-        uc:add_units(u)
-        return 1
-    end },
-    { "ability decisions (may cast)", function()
-        local snap = take_snapshot()
-        S.last_snap = snap
-        for _, pa in ipairs(snap.player_armies) do process_army(pa, snap) end
-        return #snap.friends
-    end },
-    { "engagement planning (may give attack orders)", function()
-        local snap = take_snapshot()
-        run_engagement(snap)
-        return #snap.friends
-    end },
-}
-
-local function run_bisect_step()
-    -- debug_bisect = true starts at step 1; a number starts at that step
-    if not S.bisect_i and type(cfg.debug_bisect) == "number" then S.bisect_i = math.max(0, cfg.debug_bisect - 1) end
-    S.bisect_i = (S.bisect_i or 0) + 1
-    local step = BISECT[S.bisect_i]
-    if not step then return false end
-    log(1, "bisect %d/%d: %s", S.bisect_i, #BISECT, step[1])
-    flush_log()
-    local ok, r = pcall(step[2])
-    log(1, "  bisect %d done (%s)", S.bisect_i, ok and ("ok, " .. tostring(r) .. " units") or ("error: " .. tostring(r)))
-    flush_log()
-    return true
 end
 
 local function tick(driver)
@@ -1622,19 +1162,12 @@ local function tick(driver)
     end
     S.pause_logged = false
     S.ticks = (S.ticks or 0) + 1
-    if cfg.debug_bisect and not S.bisect_done then
-        if run_bisect_step() then return end
-        S.bisect_done = true
-        log(1, "bisect finished: all steps ran; normal ticks from now on")
-    end
     local snap = take_snapshot()
-    S.last_snap = snap
-    -- tell the UI side which units' abilities to read
-    local watch = {}
-    for _, pa in ipairs(snap.player_armies) do
-        for _, u in ipairs(pa.units) do watch[u.uid] = true end
-    end
-    S.ui_watch = watch
+    snap.now = S.now
+    S.last_snap = snap   -- the auto-cast script reads this
+    chk("snapshot")
+    track_units(snap)
+    release_due()
     if not S.contact then
         for _, u in ipairs(snap.friends) do
             if u.melee or u.under_fire or u.shooting then S.contact = true; break end
@@ -1660,18 +1193,21 @@ local function tick(driver)
         log(1, "tick %d: %d of your units under the mod (%d set to off) in %d army(ies); %d friendly and %d visible enemy units",
             S.ticks, mine, off, #snap.player_armies, #snap.friends, #snap.enemies)
     end
-    verify_pending(snap)
-    for _, pa in ipairs(snap.player_armies) do
-        process_army(pa, snap)
+    chk("bookkeeping")
+    if S.ticks <= 3 then
+        log(1, "memory: %.1f MB%s", mem_mb(), S.gc_stopped and " (garbage collector stopped)" or "")
+    end
+    if not S.grace_logged and S.now >= (cfg.start_grace_seconds or 0) then
+        S.grace_logged = true
+        if (cfg.start_grace_seconds or 0) > 0 then
+            log(1, "start grace over (%d s): idle units may now pick targets", cfg.start_grace_seconds)
+        end
     end
     run_engagement(snap)
-    prune()
+    chk("engagement")
     if S.now >= S.next_summary then
         S.next_summary = S.now + 30
-        local w = {}
-        for _, a in pairs(S.armies) do w[#w + 1] = string.format("%.0f/%.0f", a.winds or 0, a.reserve or 0) end
-        log(1, "summary: casts=%d spells=%d failed=%d restored=%d engages=%d winds(pool/reserve)=%s",
-            S.stats.casts, S.stats.spells, S.stats.failed, S.stats.restored, S.stats.engages, table.concat(w, " "))
+        log(1, "summary: engages=%d", S.stats.engages)
     end
     flush_log()
 end
@@ -1752,52 +1288,15 @@ local function toggle_all()
     toast(S.paused and "Proactive Command: paused" or "Proactive Command: active")
 end
 
--- UI side: read ability states, press queued ability buttons, resolve player orders.
--- Never queries the battle model (units, armies, game time).
+local function toggle_engage()
+    S.engage_on = not S.engage_on
+    toast(S.engage_on and "Proactive Command: auto-engage ON" or "Proactive Command: auto-engage OFF")
+end
+
+-- UI timer: only a watchdog. (The auto-cast script has its own UI timer.)
 local function ui_step()
     if not S.running then return end
-    local root = cco("CcoBattleRoot", "")
-    if not root then return end
     local now = clock()
-    -- player orders: the units selected when an order was given get the grace period
-    if S.player_cmd_pending then
-        local t = S.player_cmd_pending
-        S.player_cmd_pending = nil
-        for _, id in ipairs(selected_uids()) do
-            local st = unit_state(id)
-            st.player_order_at = t
-            st.engaged_target = nil
-        end
-    end
-    -- ability states for the units the mod looks after
-    for uid in pairs(S.ui_watch) do
-        local entry = ui_read_abilities(root, uid)
-        if entry then S.ab_cache[uid] = entry end
-    end
-    -- press queued ability buttons
-    if #S.cast_queue > 0 then
-        local queue = S.cast_queue
-        S.cast_queue = {}
-        for _, q in ipairs(queue) do
-            if now - q.at <= 3 then
-                local entry = S.ab_cache[q.uid]
-                local ab = entry and entry.by_key[q.key]
-                local ok, err = false, "ability not found"
-                if ab then ok, err = pcall(function() ab:Call("PerformAbilityForOwner") end) end
-                if not ok then
-                    log(1, "FAILED %s by %s via cco: %s", q.name, q.type, tostring(err))
-                    S.stats.failed = S.stats.failed + 1
-                end
-            end
-        end
-    end
-    -- status line (UI side, no game queries): how often each timer has fired
-    S.ui_n = (S.ui_n or 0) + 1
-    if S.canary and (S.ui_n <= 120 and S.ui_n % 4 == 0 or S.ui_n % 60 == 0) then
-        log(1, "status: ticks=%d timer calls engine=%d shared=%d canary engine=%d shared=%d",
-            S.ticks or 0, S.driver_calls.engine or 0, S.driver_calls.shared or 0, S.canary.engine, S.canary.shared)
-    end
-    -- notice when the game-clock ticks stop (game paused, or the timers died)
     if S.last_model_clock and now - S.last_model_clock > 4 and not S.stall_logged and not S.paused then
         S.stall_logged = true
         log(1, "note: no game-clock tick for 4 s (the game is paused, or the game-clock timers stopped)")
@@ -1813,6 +1312,11 @@ local function register_hotkeys()
     core:add_listener("proactive_command_hotkeys", "ShortcutTriggered",
         function(context) return context.string == cfg.hotkey_toggle_all end,
         guarded("toggle_all", toggle_all), true)
+    if cfg.hotkey_toggle_engage and cfg.hotkey_toggle_engage ~= "" then
+        core:add_listener("proactive_command_hotkeys", "ShortcutTriggered",
+            function(context) return context.string == cfg.hotkey_toggle_engage end,
+            guarded("toggle_engage", toggle_engage), true)
+    end
 end
 
 --------------------------------------------------------------------------------
@@ -1823,7 +1327,12 @@ local function start_battle()
     if S.running then return end
     S.running = true
     S.now = 0
-    log(1, "battle started: ticking every %.1fs (auto engage: %s)", cfg.tick_seconds, tostring(cfg.auto_engage))
+    log(1, "battle started: ticking every %.1fs (auto engage: %s, mode: %s)",
+        cfg.tick_seconds, tostring(cfg.auto_engage), tostring(cfg.engage_mode))
+    if cfg.gc_mode == "stop" and pcall(collectgarbage, "stop") then
+        S.gc_stopped = true
+        log(1, "garbage collector stopped for this battle (gc_mode = stop), memory %.1f MB", mem_mb())
+    end
     if S.babysitter_warning then toast("Proactive Command: disable Just Good Babysitter - both mods command idle units") end
     local ms = math.floor(cfg.tick_seconds * 1000)
     -- Three independent timers call the tick; it runs once per interval (see tick). The first
@@ -1846,13 +1355,6 @@ local function start_battle()
     local ok_engine = pcall(function() bm:register_repeating_timer("proactive_command_tick_timer", ms) end)
     -- 2) the game's shared script timer
     local ok_shared = pcall(function() bm:repeat_callback(guarded("tick", function() drive("shared") end), ms, "proactive_command_tick") end)
-    -- canaries: trivial timers of both game-clock kinds that only count, to tell whether the
-    -- game stops all script timers or only ours
-    S.canary = { engine = 0, shared = 0 }
-    proactive_command_canary_timer = function() S.canary.engine = S.canary.engine + 1 end
-    if _G then _G.proactive_command_canary_timer = proactive_command_canary_timer end
-    pcall(function() bm:register_repeating_timer("proactive_command_canary_timer", ms) end)
-    pcall(function() bm:repeat_callback(function() S.canary.shared = S.canary.shared + 1 end, ms, "proactive_command_canary") end)
     -- 3) the UI side (abilities, ability buttons, player orders) on a UI timer
     local ui_calls = 0
     local ok_real = pcall(function()
@@ -1869,18 +1371,28 @@ end
 local function stop_battle(reason)
     if not S.running then return end
     S.running = false
+    if S.last_snap then
+        for uid, st in pairs(S.units) do
+            if st.ai then
+                local u = S.last_snap.by_uid[uid]
+                if u then pcall(ai_release, u, st, "battle over") end
+            end
+        end
+    end
+    if S.gc_stopped then
+        S.gc_stopped = false
+        pcall(collectgarbage, "restart")
+    end
     pcall(function() bm:remove_process("proactive_command_tick") end)
     pcall(function() bm:unregister_timer("proactive_command_tick_timer") end)
     pcall(function() bm:remove_real_callback("proactive_command_ui") end)
-    pcall(function() bm:unregister_timer("proactive_command_canary_timer") end)
-    pcall(function() bm:remove_process("proactive_command_canary") end)
-    log(1, "stopped (%s). casts=%d spells=%d failed=%d restored=%d engages=%d",
-        reason, S.stats.casts, S.stats.spells, S.stats.failed, S.stats.restored, S.stats.engages)
+    log(1, "stopped (%s). engages=%d", reason, S.stats.engages)
     flush_log()
 end
 
 local function init()
     load_user_config()
+    S.engage_on = cfg.auto_engage ~= false
     start_log()
     log(1, "Proactive Command %s loading (user config: %s)", VERSION, S.user_config and "yes" or "no")
     if PROACTIVE_COMMAND_DEV_STATUS then log(1, "development mode: %s", PROACTIVE_COMMAND_DEV_STATUS) end
@@ -1915,7 +1427,6 @@ local function init()
     log(1, "catalog: %d abilities, generated %s %s", n, tostring(cat.meta and cat.meta.generated),
         cat.meta and cat.meta.extra_packs and ("+" .. cat.meta.extra_packs) or "")
     register_hotkeys()
-    register_command_watch()
     if cfg.auto_engage and type(jg77_babysitter_common) == "function" then
         log(1, "NOTE: Just Good Babysitter is also active. Both mods give orders to idle units; disable one of them.")
         S.babysitter_warning = true
@@ -1936,4 +1447,15 @@ if not ok then
 end
 
 -- exposed for debugging from the console / other mods
-proactive_command = { state = S, config = cfg, version = VERSION, toggle = toggle_all }
+proactive_command = {
+    state = S, config = cfg, version = VERSION,
+    toggle = toggle_all, toggle_engage = toggle_engage,
+    -- for proactive_command_cast.lua
+    log = log, flush = flush_log, toast = toast,
+    mode_for = function(uid)
+        local st = S.units[uid]
+        if st and st.mode then return st.mode end
+        local u = S.last_snap and S.last_snap.by_uid[uid]
+        return u and default_mode(u) or cfg.default_mode_units
+    end,
+}

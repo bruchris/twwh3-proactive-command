@@ -104,6 +104,19 @@ function UnitMT:missile_range() return self._mrange end
 function UnitMT:current_target() return self.target end
 function UnitMT:is_visible_to_alliance() return true end
 function UnitMT:is_ai_controlled() return self.ai end
+function UnitMT:is_script_controlled() return self.script_ctrl or false end
+function UnitMT:is_player_controlled() return not self.script_ctrl end
+function UnitMT:owned_non_passive_special_abilities()
+    local t = {}
+    for _, a in ipairs(self.abilities) do t[#t + 1] = a.key end
+    return t
+end
+function UnitMT:can_perform_special_ability(key)
+    for _, a in ipairs(self.abilities) do
+        if a.key == key then return a:can() end
+    end
+    return false
+end
 function UnitMT:army() return self._army end
 function UnitMT:ordered_position() return newvec(self.order_x or self.x, 0, self.order_z or self.z) end
 function UnitMT:ordered_bearing() return 0 end
@@ -120,27 +133,37 @@ function UCMT:perform_special_ability(key, target)
     local u = self.units[1]
     local a = find_ability(u, key)
     if not a then error("unit does not own " .. key) end
+    if a.targeted and not target then error("ability " .. key .. " needs a target") end
+    u.script_ctrl = true
     a:perform(target and target.name or "nil", "uc")
+end
+function UCMT:release_control()
+    for _, u in ipairs(self.units) do u.script_ctrl = false end
+    M.events[#M.events + 1] = { t = M.time, kind = "release", by = self.units[1].name }
 end
 function UCMT:perform_special_ability_ground(key, pos)
     local u = self.units[1]
     local a = find_ability(u, key)
     if not a then error("unit does not own " .. key) end
+    u.script_ctrl = true
     a:perform(string.format("ground(%.0f,%.0f)", pos.x, pos.z), "ground")
 end
 function UCMT:attack_unit(target, primary, fast)
     local u = self.units[1]
     M.events[#M.events + 1] = { t = M.time, kind = "attack", by = u.name, target = target.name, fast = fast }
-    u.target = target; u.idle = false
+    u.target = target; u.idle = false; u.script_ctrl = true
 end
-function UCMT:goto_location_angle_width(pos) M.events[#M.events + 1] = { t = M.time, kind = "restore_move", by = self.units[1].name } end
+function UCMT:goto_location_angle_width(pos)
+    self.units[1].script_ctrl = true
+    M.events[#M.events + 1] = { t = M.time, kind = "restore_move", by = self.units[1].name }
+end
 
 -- armies / alliances ----------------------------------------------------------------
 local ArmyMT = {}
 ArmyMT.__index = ArmyMT
 function M.add_army(alliance, def)
     local a = setmetatable({ unit_list = {}, player = def.player or false, winds = def.winds or 0,
-        reserve = def.reserve or 0, id = #M.alliances * 10 + #alliance.army_list + 1 }, ArmyMT)
+        reserve = def.reserve or 0, id = #M.alliances * 10 + #alliance.army_list + 1, _alliance = alliance }, ArmyMT)
     alliance.army_list[#alliance.army_list + 1] = a
     return a
 end
@@ -158,11 +181,43 @@ function ArmyMT:winds_of_magic_current() return self.winds end
 function ArmyMT:winds_of_magic_reserve() return self.reserve end
 function ArmyMT:winds_of_magic_remaining_recharge_rate() return 0.5 end
 function ArmyMT:create_unit_controller() return setmetatable({ units = {} }, UCMT) end
+function ArmyMT:alliance() return self._alliance end
+
+-- the engine's AI unit planner (what script_ai_planner wraps): units handed to it are played by the game's own AI
+local PlannerMT = {}
+PlannerMT.__index = PlannerMT
+function PlannerMT:add_units(unit)
+    self.units[#self.units + 1] = unit
+    unit.ai_planned = self
+    unit.script_ctrl = true
+    M.events[#M.events + 1] = { t = M.time, kind = "ai_add", by = unit.name }
+end
+function PlannerMT:remove_units(unit)
+    for i, u in ipairs(self.units) do if u == unit then table.remove(self.units, i) break end end
+    unit.ai_planned = nil
+    unit.script_ctrl = false
+    M.events[#M.events + 1] = { t = M.time, kind = "ai_remove", by = unit.name }
+end
+function PlannerMT:defend_position(pos, radius)
+    for _, u in ipairs(self.units) do
+        u.idle = false; u.script_ctrl = true
+        M.events[#M.events + 1] = { t = M.time, kind = "ai_defend", by = u.name, radius = radius }
+    end
+end
+function PlannerMT:attack_unit(target)
+    for _, u in ipairs(self.units) do
+        u.idle = false; u.script_ctrl = true
+        M.events[#M.events + 1] = { t = M.time, kind = "ai_attack", by = u.name, target = target.name }
+    end
+end
 
 function M.add_alliance()
     local al = { army_list = {} }
     al.armies = function(self) return collection(self.army_list) end
     M.alliances[#M.alliances + 1] = al
+    al.create_ai_unit_planner = function(self)
+        return setmetatable({ units = {} }, PlannerMT)
+    end
     return al
 end
 
@@ -198,8 +253,11 @@ local function unit_cco(u)
         if expr == "IsCharacter" then return u.is_character end
         if expr == "UniqueUiId" then return u.uid end
         if expr == "BattleAbilityList.Size" then return #u.abilities end
-        local k = string.match(expr, "^BattleAbilityList%.At%((%d+)%)$")
-        if k then return ability_cco(u.abilities[tonumber(k) + 1]) end
+        local i = string.match(expr, "^BattleAbilityList%.At%((%d+)%)$")
+        if i then
+            local a = u.abilities[tonumber(i) + 1]
+            return a and ability_cco(a)
+        end
         error("unknown unit expr " .. expr)
     end }
 end
@@ -427,6 +485,22 @@ function M.casts(filter)
 end
 
 function M.reset_events() M.events = {} end
+
+function M.releases(by)
+    local r = {}
+    for _, e in ipairs(M.events) do
+        if e.kind == "release" and (not by or e.by == by) then r[#r + 1] = e end
+    end
+    return r
+end
+
+function M.ai_events(kind, by)
+    local r = {}
+    for _, e in ipairs(M.events) do
+        if e.kind == kind and (not by or e.by == by) then r[#r + 1] = e end
+    end
+    return r
+end
 
 function M.attacks(by)
     local r = {}

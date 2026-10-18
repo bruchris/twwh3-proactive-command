@@ -12,6 +12,7 @@ from lupa import lua51
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 MOD = os.path.join(ROOT, "mod_src", "script", "battle", "mod", "proactive_command.lua")
+CAST = os.path.join(ROOT, "mod_src", "script", "battle", "mod", "proactive_command_cast.lua")
 CATALOG = os.environ.get("PC_CATALOG", os.path.join(HERE, "test_catalog.lua"))
 
 COMMON = r"""
@@ -22,12 +23,18 @@ P = M.add_army(player, { player = true, winds = 30, reserve = 40 })
 E = M.add_army(enemy, {})
 function setup_done()
     dofile_mod()
+    dofile_cast()
     M.phase("Deployed")
 end
 function names(list)
     local t = {}
     for _, e in ipairs(list) do t[#t + 1] = string.format("%.1f:%s>%s(%s)", e.t, e.key:gsub("^wh%d?_[%w]+_", ""), e.target or "?", e.how) end
     return table.concat(t, " ")
+end
+function write_config(extra)
+    local f = io.open("proactive_command_config.lua", "w")
+    f:write("return { start_grace_seconds = 0, idle_delay = 0, idle_delay_under_attack = 0, cast_start_grace_seconds = 0, auto_cast = true, engage_mode = \"mod\", " .. (extra or "") .. " }")
+    f:close()
 end
 function expect(cond, msg) if not cond then error("EXPECTATION FAILED: " .. msg, 2) end end
 """
@@ -38,185 +45,6 @@ SCENARIOS = {}
 def scenario(fn):
     SCENARIOS[fn.__name__] = fn.__doc__
     return fn
-
-
-@scenario
-def melee_self_buff():
-    """
-    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, x = 0, z = 0,
-        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 },
-                      { key = "wh_main_item_abilities_potion_of_strength", cd = 60, dur = 33, uses = 1 },
-                      { key = "wh2_dlc14_lord_abilities_tzarkan_spite_mp", cd = 0, dur = 0 } } })
-    local en = M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 40 })
-    setup_done()
-    M.advance(5)
-    expect(#M.casts() == 0, "no casts out of melee, got " .. names(M.casts()))
-    kf.melee = true; en.melee = true
-    M.advance(4)
-    expect(#M.casts("sword_of_anti_heroes") == 1, "sword in melee: " .. names(M.casts()))
-    expect(#M.casts("potion_of_strength") == 1, "potion in melee: " .. names(M.casts()))
-    expect(#M.casts("tzarkan") == 0, "never transforms")
-    expect(M.casts("sword")[1].how == "cco", "self buff uses PerformAbilityForOwner")
-    M.advance(30)
-    expect(#M.casts("sword_of_anti_heroes") == 1, "no recast while active/cooldown")
-    """
-
-
-@scenario
-def charge_buff():
-    """
-    local cav = M.add_unit(P, { name = "daemon", type = "wh_main_emp_cav_reiksguard", x = 0, z = 0,
-        abilities = { { key = "wh3_main_daemon_legs_abilities_daemonic_onslaught", cd = 90, dur = 34 } } })
-    local en = M.add_unit(E, { name = "furies", type = "wh3_main_kho_inf_chaos_furies_0", x = 0, z = 50 })
-    setup_done()
-    M.advance(3)
-    expect(#M.casts() == 0, "not charging yet")
-    cav.moving = true; cav.moving_fast = true; cav.target = en
-    M.advance(2)
-    expect(#M.casts("daemonic_onslaught") == 1, "charge buff while charging: " .. names(M.casts()))
-    """
-
-
-@scenario
-def fire_wizard_targets():
-    """
-    local wiz = M.add_unit(P, { name = "fire_wizard", type = "wh_main_emp_cha_wizard_fire_0", men = 1, is_character = true, x = 0, z = 0,
-        abilities = { { key = "wh_main_spell_fire_fireball", mana = 5, cd = 29, dur = 0, targeted = true },
-                      { key = "wh_main_spell_fire_fireball_upgraded", mana = 9, cd = 29, dur = 0, targeted = true },
-                      { key = "wh_main_spell_fire_the_burning_head", mana = 10, cd = 37, dur = 20, targeted = true } } })
-    local sw = M.add_unit(P, { name = "swordsmen", type = "wh_main_emp_inf_swordsmen", x = 0, z = 60, melee = true })
-    local en1 = M.add_unit(E, { name = "warriors_in_melee", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 70, melee = true })
-    local en2 = M.add_unit(E, { name = "bloodletters_far", type = "wh3_main_kho_inf_bloodletters_0", x = 120, z = 150 })
-    setup_done()
-    M.advance(10)
-    local c = M.casts()
-    expect(#M.casts("upgraded") == 0, "never overcasts by default")
-    for _, e in ipairs(M.casts("burning_head")) do
-        expect(e.target ~= "warriors_in_melee", "burning head must not hit the melee next to own swordsmen")
-    end
-    for _, e in ipairs(M.casts("fireball")) do
-        expect(e.target ~= "warriors_in_melee", "fireball must avoid the engaged target (friendly fire): " .. names(c))
-    end
-    expect(#c >= 1, "wizard should cast something at the free target: " .. names(c))
-    """
-
-
-@scenario
-def comet_friendly_fire():
-    """
-    local wiz = M.add_unit(P, { name = "heavens_wizard", type = "wh_main_emp_cha_wizard_heavens_0", men = 1, is_character = true, x = 0, z = 0,
-        abilities = { { key = "wh_main_spell_heavens_comet_of_casandora", mana = 13, cd = 49, dur = 7, targeted = true } } })
-    local sw = M.add_unit(P, { name = "swordsmen", type = "wh_main_emp_inf_swordsmen", x = 0, z = 100, melee = true })
-    local blob = {}
-    for i = 1, 3 do blob[i] = M.add_unit(E, { name = "blob" .. i, type = "wh3_main_kho_inf_chaos_warriors_0", x = (i - 2) * 15, z = 110, melee = true }) end
-    setup_done()
-    M.advance(8)
-    expect(#M.casts("comet") == 0, "comet must not be dropped on the engaged blob: " .. names(M.casts()))
-    -- a second, standing enemy blob far from own units
-    for i = 1, 3 do M.add_unit(E, { name = "far" .. i, type = "wh3_main_kho_inf_bloodletters_0", x = 150 + (i - 2) * 12, z = 120 }) end
-    M.advance(6)
-    local c = M.casts("comet")
-    expect(#c == 1 and string.find(c[1].target, "far", 1, true), "comet on the free standing blob: " .. names(M.casts()))
-    """
-
-
-@scenario
-def winds_budget():
-    """
-    P.winds = 20; P.reserve = 0
-    local w1 = M.add_unit(P, { name = "wiz1", type = "wh_main_emp_cha_wizard_fire_0", men = 1, is_character = true, x = 0, z = 0,
-        abilities = { { key = "wh_main_spell_fire_fireball", mana = 5, cd = 10, dur = 0, targeted = true } } })
-    local w2 = M.add_unit(P, { name = "wiz2", type = "wh_main_emp_cha_wizard_heavens_0", men = 1, is_character = true, x = 10, z = 0,
-        abilities = { { key = "wh_main_spell_death_spirit_leech", mana = 8, cd = 10, dur = 13, targeted = true } } })
-    local lord = M.add_unit(E, { name = "enemy_lord", type = "wh_main_emp_cha_karl_franz_0", men = 1, x = 0, z = 90 })
-    for i = 1, 3 do M.add_unit(E, { name = "inf" .. i, type = "wh3_main_kho_inf_chaos_warriors_0", x = i * 30, z = 140 }) end
-    setup_done()
-    M.advance(60)
-    local c = M.casts()
-    local last = -100
-    for _, e in ipairs(c) do
-        expect(e.t - last >= 3.9, "spells must be spaced: " .. names(c))
-        last = e.t
-    end
-    expect(#c >= 2, "should still cast: " .. names(c))
-    expect(P.winds >= 0, "never negative")
-    print("   winds left: " .. string.format("%.1f", P.winds) .. "  casts: " .. names(c))
-    expect(P.winds >= 3, "keeps a reserve of winds (got " .. P.winds .. ")")
-    """
-
-
-@scenario
-def area_buff_and_hex():
-    """
-    local wiz = M.add_unit(P, { name = "wizard", type = "wh_main_emp_cha_wizard_fire_0", men = 1, is_character = true, x = 0, z = 0,
-        abilities = { { key = "wh_main_spell_fire_flaming_sword_of_rhuin", mana = 7, cd = 44, dur = 28, targeted = true },
-                      { key = "wh_main_spell_metal_plague_of_rust", mana = 4, cd = 28, dur = 44, targeted = true } } })
-    local a = M.add_unit(P, { name = "sw1", type = "wh_main_emp_inf_swordsmen", x = 0, z = 60, melee = true })
-    local b = M.add_unit(P, { name = "sw2", type = "wh_main_emp_inf_swordsmen", x = 20, z = 60, melee = true })
-    local e1 = M.add_unit(E, { name = "armoured", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 70, melee = true })
-    local e2 = M.add_unit(E, { name = "unarmoured", type = "wh3_main_kho_inf_chaos_furies_0", x = 20, z = 70, melee = true })
-    setup_done()
-    M.advance(12)
-    local c = M.casts()
-    expect(#M.casts("flaming_sword") == 1, "area buff on the melee: " .. names(c))
-    local rust = M.casts("plague_of_rust")
-    expect(#rust == 1 and rust[1].target == "armoured", "plague of rust on the armoured enemy: " .. names(c))
-    """
-
-
-@scenario
-def player_aiming_and_modes():
-    """
-    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, x = 0, z = 0, melee = true,
-        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
-    local en = M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
-    kf.abilities[1].aiming = true
-    setup_done()
-    M.advance(3)
-    expect(#M.casts() == 0, "never acts while the player is aiming an ability of that unit")
-    kf.abilities[1].aiming = false
-    -- cycle the unit to "off" (full -> off)
-    M.selection = { kf }
-    M.shortcut("camera_bookmark_save9")
-    expect(M.last_toast and string.find(M.last_toast, "Off", 1, true), "toast shows new mode: " .. tostring(M.last_toast))
-    M.advance(3)
-    expect(#M.casts() == 0, "mode off respected")
-    M.shortcut("camera_bookmark_save9") -- abilities
-    M.advance(2)
-    expect(#M.casts("sword") == 1, "mode abilities casts again: " .. names(M.casts()))
-    M.shortcut("camera_bookmark_save10")
-    expect(string.find(M.last_toast, "paused", 1, true), "toggle all pauses")
-    """
-
-
-@scenario
-def summon_when_threatened():
-    """
-    local vamp = M.add_unit(P, { name = "necromancer", type = "wh_main_emp_cha_wizard_fire_0", men = 1, is_character = true, x = 0, z = 0,
-        abilities = { { key = "wh_main_spell_vampires_raise_dead", mana = 5, cd = 39, dur = 1, uses = 7, targeted = true } } })
-    local en = M.add_unit(E, { name = "furies", type = "wh3_main_kho_inf_chaos_furies_0", x = 0, z = 200 })
-    setup_done()
-    M.advance(5)
-    expect(#M.casts() == 0, "no summon without threat")
-    en.z = 30; vamp.melee = true; en.melee = true
-    M.advance(5)
-    local c = M.casts("raise_dead")
-    expect(#c == 1 and c[1].how == "ground", "summons on the ground near the caster: " .. names(M.casts()))
-    """
-
-
-@scenario
-def restore_orders():
-    """
-    local wiz = M.add_unit(P, { name = "wizard", type = "wh_main_emp_cha_wizard_fire_0", men = 1, is_character = true, x = 0, z = 0,
-        abilities = { { key = "wh_main_spell_death_spirit_leech", mana = 8, cd = 30, dur = 13, targeted = true, stops_caster = true } } })
-    local lord = M.add_unit(E, { name = "enemy_lord", type = "wh_main_emp_cha_karl_franz_0", men = 1, x = 0, z = 60 })
-    wiz.target = lord; wiz.idle = false
-    setup_done()
-    M.advance(6)
-    expect(#M.casts("spirit_leech") == 1, "spirit leech on the lord: " .. names(M.casts()))
-    expect(#M.attacks("wizard") == 1, "re-issued the attack order after the cast stopped the caster")
-    """
 
 
 @scenario
@@ -235,8 +63,6 @@ def multiplayer_own_army_only():
     M.add_unit(E, { name = "warriors2", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 80 })
     setup_done()
     M.advance(5)
-    for _, e in ipairs(M.casts()) do expect(e.by == "karl", "only my own units cast, got " .. e.by) end
-    expect(#M.casts() == 1, "my lord still uses his ability")
     expect(#M.attacks("friends_swordsmen") == 0 and #M.attacks("friends_karl") == 0, "never commands the other player's army")
     expect(#M.attacks("my_swordsmen") == 1, "my own units still engage")
     """
@@ -259,7 +85,6 @@ def multiplayer_second_player():
     M.add_unit(E, { name = "warriors2", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 80 })
     setup_done()
     M.advance(5)
-    expect(#M.casts() == 1 and M.casts()[1].by == "my_karl", "the second player's copy casts only for its own lord")
     expect(#M.attacks("host_swordsmen") == 0 and #M.attacks("host_karl") == 0, "leaves the host's army alone")
     expect(#M.attacks("my_swordsmen") == 1, "the second player's units engage")
     """
@@ -269,13 +94,13 @@ def multiplayer_second_player():
 def multiplayer_switched_off():
     """
     M.multiplayer = true
-    local f = io.open("proactive_command_config.lua", "w"); f:write("return { allow_in_multiplayer = false }"); f:close()
+    write_config("allow_in_multiplayer = false")
     local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, melee = true,
         abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
     M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
     setup_done()
     M.advance(5)
-    expect(#M.casts() == 0 and #M.attacks() == 0, "does nothing in multiplayer when switched off")
+    expect(#M.attacks() == 0 and #M.ai_events("ai_add") == 0, "does nothing in multiplayer when switched off")
     """
 
 
@@ -292,7 +117,6 @@ def reinforcements_included():
     M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
     setup_done()
     M.advance(5)
-    expect(#M.casts() == 1 and M.casts()[1].by == "reinf_karl", "a reinforcing lord uses his ability")
     expect(#M.attacks("reinf_swordsmen") == 1, "reinforcing units engage")
     """
 
@@ -303,16 +127,17 @@ def dev_mode_loose_copy():
     local src = io.open(MOD_PATH):read("*a")
     local dev = src:gsub('local VERSION = "[^"]+"', 'local VERSION = "9.9.9-dev"', 1)
     local f = io.open("pc_dev_copy.lua", "w"); f:write(dev); f:close()
-    f = io.open("proactive_command_config.lua", "w"); f:write('return { dev_script_path = "pc_dev_copy.lua" }'); f:close()
+    write_config('dev_script_path = "pc_dev_copy.lua"')
     local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, melee = true,
         abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
     M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
+    M.add_unit(P, { name = "swordsmen", type = "wh_main_emp_inf_swordsmen", x = 40, z = 0 })
     setup_done()
     M.advance(5)
     local log = io.open("proactive_command_log.txt"):read("*a")
     expect(log:find("9.9.9-dev", 1, true), "the development copy ran")
     expect(log:find("running the development copy", 1, true), "the log says so")
-    expect(#M.casts() == 1, "it works normally, once")
+    expect(#M.attacks("swordsmen") == 1, "it works normally, once")
     """
 
 
@@ -320,15 +145,16 @@ def dev_mode_loose_copy():
 def dev_mode_broken_copy_falls_back():
     """
     local f = io.open("pc_dev_copy.lua", "w"); f:write("this is not lua ("); f:close()
-    f = io.open("proactive_command_config.lua", "w"); f:write('return { dev_script_path = "pc_dev_copy.lua" }'); f:close()
+    write_config('dev_script_path = "pc_dev_copy.lua"')
     local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, melee = true,
         abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
     M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
+    M.add_unit(P, { name = "swordsmen", type = "wh_main_emp_inf_swordsmen", x = 40, z = 0 })
     setup_done()
     M.advance(5)
     local log = io.open("proactive_command_log.txt"):read("*a")
     expect(log:find("using the packed copy", 1, true), "a syntax error falls back to the packed copy")
-    expect(#M.casts() == 1, "the packed copy works")
+    expect(#M.attacks("swordsmen") == 1, "the packed copy works")
     """
 
 
@@ -357,26 +183,6 @@ def heartbeat_and_pause_logged():
 
 
 @scenario
-def survives_shared_timer_dying():
-    """
-    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, melee = true,
-        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 20, dur = 5 } } })
-    local en = M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
-    setup_done()
-    M.advance(1.5)
-    M.kill_shared_timer()                 -- another mod's callback errors at 1.5 s
-    M.advance(60)
-    local log = io.open("proactive_command_log.txt"):read("*a")
-    expect(log:find("timers: game-clock engine on, game-clock shared on, ui on", 1, true), "all three timers are started")
-    expect(log:find("tick 3:", 1, true), "ticks keep coming on the engine timer")
-    expect(#M.casts() >= 2, "the lord keeps casting after the shared timer died (" .. #M.casts() .. ")")
-    local n = 0
-    for _ in log:gmatch("summary:") do n = n + 1 end
-    expect(n >= 2, "summaries keep coming")
-    """
-
-
-@scenario
 def model_timers_dying_is_reported():
     """
     local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, melee = true,
@@ -392,52 +198,6 @@ def model_timers_dying_is_reported():
 
 
 @scenario
-def ui_and_model_sides_stay_separate():
-    """
-    -- the mock raises an error if a UI context object is used from a game-clock callback or the
-    -- game model is queried from a UI callback; a full battle with casts, engagements, hotkeys
-    -- and player orders must run without a single such error
-    M.simulate = true
-    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, melee = true, x = 0, z = 0,
-        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 30, dur = 10 } } })
-    local wiz = M.add_unit(P, { name = "wizard", type = "wh_main_emp_cha_wizard_fire_0", men = 1, is_character = true, x = -30, z = -20,
-        abilities = { { key = "wh_main_spell_fire_fireball", targeted = true, mana = 6, cd = 15 } } })
-    local cav = M.add_unit(P, { name = "reiksguard", type = "wh_main_emp_cav_reiksguard", x = 60, z = 0 })
-    local sw = M.add_unit(P, { name = "swordsmen", type = "wh_main_emp_inf_swordsmen", x = 20, z = 0 })
-    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 60 })
-    M.add_unit(E, { name = "warriors2", type = "wh3_main_kho_inf_chaos_warriors_0", x = 50, z = 80 })
-    M.add_unit(E, { name = "archers", type = "wh3_main_kho_inf_marauder_archers", x = 90, z = 140 })
-    setup_done()
-    M.advance(5)
-    M.selection = { sw }
-    M.shortcut("camera_bookmark_save9")   -- cycle mode of the selected unit (UI event)
-    M.player_command("Move", { sw })      -- player order (model-side command handler)
-    M.advance(30)
-    local log = io.open("proactive_command_log.txt"):read("*a")
-    expect(not log:find("ERROR", 1, true), "no errors at all: " .. log)
-    expect(#M.casts() >= 1, "abilities are cast (" .. #M.casts() .. ")")
-    expect(#M.attacks() >= 1, "units engage (" .. #M.attacks() .. ")")
-    """
-
-
-@scenario
-def debug_bisect_steps():
-    """
-    local f = io.open("proactive_command_config.lua", "w"); f:write("return { debug_bisect = true }"); f:close()
-    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, melee = true,
-        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 20, dur = 5 } } })
-    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
-    setup_done()
-    M.advance(45)
-    local log = io.open("proactive_command_log.txt"):read("*a")
-    expect(log:find("bisect 1/", 1, true), "bisect starts")
-    expect(log:find("bisect finished", 1, true), "bisect runs through all steps")
-    expect(log:find("status: ticks=", 1, true), "status lines from the UI side")
-    expect(#M.casts() >= 1, "normal ticks afterwards (casts " .. #M.casts() .. ")")
-    """
-
-
-@scenario
 def no_double_ticks():
     """
     local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, melee = true })
@@ -449,29 +209,9 @@ def no_double_ticks():
 
 
 @scenario
-def vortex_path_safety():
-    """
-    local wiz = M.add_unit(P, { name = "death_wizard", type = "wh_main_emp_cha_wizard_fire_0", men = 1, is_character = true, x = 0, z = 0,
-        abilities = { { key = "wh_main_spell_death_the_purple_sun_of_xereus", mana = 18, cd = 54, dur = 11, targeted = true } } })
-    local blob = {}
-    for i = 1, 3 do blob[i] = M.add_unit(E, { name = "blob" .. i, type = "wh3_main_kho_inf_chaos_warriors_0", x = (i - 2) * 12, z = 100 }) end
-    -- own cavalry flanking just behind the enemy blob, on the vortex's path
-    local cav = M.add_unit(P, { name = "reiksguard", type = "wh_main_emp_cav_reiksguard", x = 0, z = 130 })
-    setup_done()
-    M.advance(6)
-    expect(#M.casts("purple_sun") == 0, "no vortex when own cavalry is on its path: " .. names(M.casts()))
-    cav.x = 200; cav.z = 0
-    M.advance(3)
-    expect(#M.casts("purple_sun") == 1, "vortex once the path is clear: " .. names(M.casts()))
-    """
-
-
-@scenario
 def user_config_file():
     """
-    local f = io.open("proactive_command_config.lua", "w")
-    f:write("return { default_mode_characters = 'off', log_level = 2 }")
-    f:close()
+    write_config("default_mode_characters = 'off', log_level = 2")
     local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, melee = true,
         abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
     M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
@@ -520,7 +260,7 @@ def engage_unlimited_reach_after_contact():
 @scenario
 def engage_unlimited_off():
     """
-    local f = io.open("proactive_command_config.lua", "w"); f:write("return { engage_unlimited = false }"); f:close()
+    write_config("engage_unlimited = false")
     local sw = M.add_unit(P, { name = "swordsmen", type = "wh_main_emp_inf_swordsmen", x = -300, z = 0, melee = true })
     local cav = M.add_unit(P, { name = "reiksguard", type = "wh_main_emp_cav_reiksguard", x = 300, z = 0 })
     local foe = M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = -300, z = 10, melee = true })
@@ -606,18 +346,157 @@ def engage_casters_and_hurt_stay():
 
 
 @scenario
-def engage_player_grace():
+def engage_only_idle_units_after_delay():
+    """
+    write_config("idle_delay = 6, idle_delay_under_attack = 1.5")
+    local idle = M.add_unit(P, { name = "idle_unit", type = "wh_main_emp_inf_swordsmen", x = 0, z = 0 })
+    -- carrying out an order of the player (walking somewhere): must never be touched
+    local busy = M.add_unit(P, { name = "busy_unit", type = "wh_main_emp_inf_swordsmen", x = 40, z = 0, idle = false, moving = true })
+    local shot = M.add_unit(P, { name = "shot_unit", type = "wh_main_emp_inf_swordsmen", x = -40, z = 0, under_fire = true })
+    local en = M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 70 })
+    setup_done()
+    M.advance(4)
+    expect(#M.attacks("idle_unit") == 0, "a unit waits for idle_delay before choosing a target")
+    expect(#M.attacks("shot_unit") == 1, "a unit that is being shot at reacts after the short delay")
+    M.advance(8)
+    expect(#M.attacks("idle_unit") == 1, "an idle unit chooses a target after the delay")
+    expect(#M.attacks("busy_unit") == 0, "a unit carrying out an order is never given another one")
+    """
+
+
+@scenario
+def start_grace_period():
+    """
+    write_config("start_grace_seconds = 15")
+    local sw = M.add_unit(P, { name = "swordsmen", type = "wh_main_emp_inf_swordsmen", x = 0, z = 0 })
+    local en = M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 60 })
+    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, x = 40, z = 0, melee = true,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
+    setup_done()
+    M.advance(14)
+    expect(#M.attacks() == 0, "no automatic orders during the start grace period: " .. #M.attacks())
+    M.advance(4)
+    expect(#M.attacks("swordsmen") == 1, "idle units get their orders once the grace period is over")
+    local log = io.open("proactive_command_log.txt"):read("*a")
+    expect(log:find("start grace over", 1, true), "the log says when the grace period ends")
+    """
+
+
+@scenario
+def units_are_handed_back_to_the_player():
     """
     local sw = M.add_unit(P, { name = "swordsmen", type = "wh_main_emp_inf_swordsmen", x = 0, z = 0 })
-    local en = M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 400 })
+    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, x = 40, z = 0, melee = true,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
+    local en = M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 60 })
+    setup_done()
+    M.advance(1.2)
+    expect(#M.attacks("swordsmen") == 1, "the unit got an order")
+    expect(sw.script_ctrl, "the mod holds the unit right after its order")
+    M.advance(5)
+    expect(not sw.script_ctrl, "the unit is back under the player's control a moment later")
+    expect(#M.releases("swordsmen") >= 1, "release_control was called for the engaging unit")
+    expect(not kf.script_ctrl or #M.ai_events("ai_add", "karl") == 0, "lord stays under the player's control")
+    """
+
+
+@scenario
+def release_can_be_switched_off():
+    """
+    write_config("release_control = false")
+    local sw = M.add_unit(P, { name = "swordsmen", type = "wh_main_emp_inf_swordsmen", x = 0, z = 0 })
+    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 60 })
+    setup_done()
+    M.advance(6)
+    expect(#M.attacks("swordsmen") == 1 and #M.releases() == 0, "no release when release_control = false")
+    """
+
+
+@scenario
+def engage_retaliates_against_attackers_first():
+    """
+    -- two cavalry units are charging this unit from 10 m away; a soft target sits far behind them
+    local sw = M.add_unit(P, { name = "swordsmen", type = "wh_main_emp_inf_swordsmen", x = 0, z = 0 })
+    local c1 = M.add_unit(E, { name = "charging1", type = "wh_main_emp_cav_reiksguard", x = 0, z = 12, moving = true, moving_fast = true })
+    local c2 = M.add_unit(E, { name = "charging2", type = "wh_main_emp_cav_reiksguard", x = 8, z = 14, moving = true, moving_fast = true })
+    c1.target = sw; c2.target = sw
+    M.add_unit(E, { name = "far_archers", type = "wh_main_emp_inf_crossbowmen", x = 0, z = 330, missile_range = 160, ammo = 20 })
+    setup_done()
+    M.advance(2)
+    local a = M.attacks("swordsmen")
+    expect(#a == 1, "the unit picks a target")
+    expect(a[1].target == "charging1" or a[1].target == "charging2", "it hits back at what is charging it, got " .. tostring(a[1] and a[1].target))
+    """
+
+
+@scenario
+def engage_prefers_near_targets():
+    """
+    local sw = M.add_unit(P, { name = "swordsmen", type = "wh_main_emp_inf_swordsmen", x = 0, z = 0 })
+    M.add_unit(E, { name = "near", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 45 })
+    M.add_unit(E, { name = "far", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 260 })
+    setup_done()
+    M.advance(2)
+    local a = M.attacks("swordsmen")
+    expect(#a == 1 and a[1].target == "near", "the nearer equal target wins, got " .. tostring(a[1] and a[1].target))
+    """
+
+
+@scenario
+def ai_mode_hands_idle_units_to_the_game_ai():
+    """
+    write_config('engage_mode = "ai", ai_hold_seconds = 10')
+    local sw = M.add_unit(P, { name = "swordsmen", type = "wh_main_emp_inf_swordsmen", x = 0, z = 0 })
+    local busy = M.add_unit(P, { name = "busy", type = "wh_main_emp_inf_swordsmen", x = 40, z = 0, idle = false, moving = true })
+    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, x = -40, z = 0 })
+    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 80 })
     setup_done()
     M.advance(3)
-    M.player_command("Move", { sw })   -- player moves the unit forward; it arrives idle
-    en.z = 80
-    M.advance(5)
-    expect(#M.attacks("swordsmen") == 0, "respects the grace period after a player order")
-    M.advance(5)
-    expect(#M.attacks("swordsmen") == 1, "acts on its own after the grace period")
+    expect(#M.ai_events("ai_add", "swordsmen") == 1, "an idle unit is handed to the game AI")
+    expect(#M.ai_events("ai_add", "karl") == 1, "so is an idle lord (the AI also casts for him)")
+    expect(#M.ai_events("ai_add", "busy") == 0, "a unit that is moving is never touched")
+    expect(#M.ai_events("ai_defend", "swordsmen") == 1, "the AI is told to defend / respond to threats")
+    expect(#M.attacks() == 0, "the mod gives no target of its own")
+    expect(sw.script_ctrl, "the unit is under AI control")
+    M.advance(14)
+    expect(#M.ai_events("ai_remove", "swordsmen") == 1, "the unit is taken from the AI after the hold time")
+    expect(#M.releases("swordsmen") >= 1, "and control is released")
+    expect(not sw.script_ctrl, "the player has it back")
+    local log = io.open("proactive_command_log.txt"):read("*a")
+    expect(log:find("AI HANDOVER", 1, true) and log:find("AI RELEASE", 1, true), "the log shows hand-over and release")
+    expect(not log:find("ERROR", 1, true), "no errors: " .. log)
+    """
+
+
+@scenario
+def ai_mode_attack_order_and_melee_hold():
+    """
+    write_config('engage_mode = "ai", ai_order = "attack", ai_hold_seconds = 5')
+    local sw = M.add_unit(P, { name = "swordsmen", type = "wh_main_emp_inf_swordsmen", x = 0, z = 0 })
+    M.add_unit(E, { name = "near", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 60 })
+    M.add_unit(E, { name = "far", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 300 })
+    setup_done()
+    M.advance(3)
+    local a = M.ai_events("ai_attack", "swordsmen")
+    expect(#a == 1 and a[1].target == "near", "attack order goes to the nearest visible enemy, got " .. tostring(a[1] and a[1].target))
+    sw.melee = true
+    M.advance(1.5)
+    expect(#M.ai_events("ai_remove", "swordsmen") == 0, "not released the moment a fight starts")
+    M.advance(3)
+    expect(#M.ai_events("ai_remove", "swordsmen") == 1, "released a few seconds into the melee: it keeps fighting, the player has it back")
+    expect(not sw.script_ctrl, "and the player can command it again")
+    """
+
+
+@scenario
+def ai_mode_player_units_in_guard_or_off_are_left_alone():
+    """
+    write_config('engage_mode = "ai"')
+    local guard = M.add_unit(P, { name = "guard", type = "wh_main_emp_inf_swordsmen", x = 0, z = 0, guard = true })
+    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 60 })
+    setup_done()
+    M.advance(4)
+    expect(#M.ai_events("ai_add") == 0, "guard mode units are never handed to the AI")
     """
 
 
@@ -702,6 +581,185 @@ def engage_full_battle_sim():
     print("   enemy units routed: " .. routed .. "/" .. #E.unit_list)
     """
 
+@scenario
+def cast_hands_a_ready_caster_to_the_game_ai():
+    """
+    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, x = 0, z = 0, idle = false, melee = true,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
+    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
+    setup_done()
+    M.advance(3.2)
+    expect(#M.ai_events("ai_add", "karl") == 1, "the caster is handed to the game AI")
+    M.advance(2)
+    expect(#M.ai_events("ai_defend", "karl") == 1, "and told to hold its position")
+    expect(#M.casts() == 0, "the mod casts nothing itself")
+    expect(kf.script_ctrl, "the unit is with the AI")
+    kf.abilities[1]:perform(nil, "ai")             -- what the game AI would do
+    M.advance(5)
+    expect(#M.ai_events("ai_remove", "karl") == 1, "taken back from the AI after it cast")
+    expect(not kf.script_ctrl, "the player has the unit again")
+    M.advance(8)
+    expect(#M.ai_events("ai_add", "karl") == 1, "not handed over again while the ability is on cooldown")
+    local log = io.open("proactive_command_log.txt"):read("*a")
+    expect(log:find("[cast] USED", 1, true) and log:find("while with the game AI", 1, true), "the log shows the use: " .. log)
+    expect(log:find("[cast] CAST HOLD", 1, true) and log:find("[cast] RELEASE", 1, true), "hold and release are logged")
+    expect(not log:find("ERROR", 1, true), "no errors")
+    """
+
+
+@scenario
+def cast_waits_for_a_reason():
+    """
+    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, x = 0, z = 0, idle = false,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
+    local en = M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 400 })
+    setup_done()
+    M.advance(5)
+    expect(#M.ai_events("ai_add", "karl") == 0, "no enemy near, no hand-over")
+    en.z = 20
+    kf.moving = true
+    M.advance(3)
+    expect(#M.ai_events("ai_add", "karl") == 0, "a unit with a move order is left alone")
+    kf.moving = false
+    kf.abilities[1].aiming = true
+    M.advance(3)
+    expect(#M.ai_events("ai_add", "karl") == 0, "never while the player is aiming an ability")
+    kf.abilities[1].aiming = false
+    M.advance(3)
+    expect(#M.ai_events("ai_add", "karl") == 1, "handed over once there is a reason")
+    """
+
+
+@scenario
+def cast_respects_winds_and_modes():
+    """
+    local wiz = M.add_unit(P, { name = "wizard", type = "wh_main_emp_cha_wizard_fire_0", men = 1, is_character = true, x = 0, z = 0, idle = false,
+        abilities = { { key = "wh_main_spell_fire_fireball", targeted = true, mana = 6, cd = 15 } } })
+    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 60 })
+    P.winds = 3
+    setup_done()
+    M.advance(4)
+    expect(#M.ai_events("ai_add", "wizard") == 0, "not enough Winds of Magic for the spell")
+    P.winds = 30
+    M.selection = { wiz }
+    M.shortcut("camera_bookmark_save9")             -- full -> off
+    M.advance(3)
+    expect(#M.ai_events("ai_add", "wizard") == 0, "a unit set to off is left alone")
+    M.shortcut("camera_bookmark_save9")             -- off -> abilities (no spells)
+    M.advance(3)
+    expect(#M.ai_events("ai_add", "wizard") == 0, "mode 'abilities' does not trigger on spells")
+    M.shortcut("camera_bookmark_save9")             -- abilities -> full
+    M.advance(3)
+    expect(#M.ai_events("ai_add", "wizard") == 1, "full mode: the wizard goes to the game AI")
+    """
+
+
+@scenario
+def cast_hold_ends_without_a_cast():
+    """
+    write_config('cast_hold_seconds = 5')
+    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, x = 0, z = 0, idle = false, melee = true,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
+    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
+    setup_done()
+    M.advance(3)
+    expect(#M.ai_events("ai_add", "karl") == 1, "handed over")
+    M.advance(8)
+    expect(#M.ai_events("ai_remove", "karl") == 1 and not kf.script_ctrl, "given back when the AI cast nothing")
+    M.advance(15)
+    expect(#M.ai_events("ai_add", "karl") == 1, "and not taken again straight away")
+    M.advance(15)
+    expect(#M.ai_events("ai_add", "karl") == 2, "but again after the cool-down")
+    """
+
+
+@scenario
+def cast_hotkey_and_pause():
+    """
+    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, x = 0, z = 0, idle = false, melee = true,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
+    local sw = M.add_unit(P, { name = "swordsmen", type = "wh_main_emp_inf_swordsmen", x = 40, z = 0 })
+    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
+    setup_done()
+    M.shortcut("camera_bookmark_save11")           -- auto-cast off before anything happens
+    expect(string.find(M.last_toast, "auto-cast OFF", 1, true), "toast: " .. tostring(M.last_toast))
+    M.advance(10)
+    expect(#M.ai_events("ai_add", "karl") == 0, "no hand-over while auto-cast is off")
+    expect(#M.attacks("swordsmen") + #M.ai_events("ai_add", "swordsmen") >= 1, "idle units still move with auto-cast off")
+    M.shortcut("camera_bookmark_save11")
+    M.advance(3)
+    expect(#M.ai_events("ai_add", "karl") == 1, "hand-over once auto-cast is back on")
+    M.shortcut("camera_bookmark_save11")           -- switching off gives the unit back at once
+    expect(not kf.script_ctrl, "and switching it off gives the unit back")
+    M.shortcut("camera_bookmark_save8")             -- the engage key is a different switch
+    expect(string.find(M.last_toast, "auto-engage OFF", 1, true), "toast: " .. tostring(M.last_toast))
+    """
+
+
+@scenario
+def cast_and_engage_share_units_politely():
+    """
+    write_config('engage_mode = "ai"')
+    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, x = 0, z = 0,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
+    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 40 })
+    setup_done()
+    M.advance(4)
+    expect(#M.ai_events("ai_add", "karl") == 1, "an idle lord near an enemy is handed over exactly once (by one script)")
+    expect(PROACTIVE_COMMAND_HOLDS[kf.uid] ~= nil, "the hold is registered")
+    """
+
+
+@scenario
+def cast_failure_does_not_stop_idle_units():
+    """
+    local kf = M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, x = 0, z = 0, idle = false,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
+    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 40 })
+    local sw = M.add_unit(P, { name = "swordsmen", type = "wh_main_emp_inf_swordsmen", x = 40, z = 0 })
+    setup_done()
+    M.advance(1)
+    proactive_command_cast.state.catalog = nil     -- break the casting script on purpose
+    proactive_command_cast.state.ab = nil
+    M.advance(8)
+    local log = io.open("proactive_command_log.txt"):read("*a")
+    expect(log:find("ERROR in cast", 1, true), "the casting script reports its error")
+    expect(#M.attacks("swordsmen") + #M.ai_events("ai_add", "swordsmen") >= 1, "idle units keep moving")
+    expect(not log:find("ERROR in tick", 1, true), "the main script is not affected")
+    """
+
+
+@scenario
+def cast_dev_mode_loose_copy():
+    """
+    local src = io.open(CAST_PATH):read("*a")
+    local dev = src:gsub('local VERSION = "[^"]+"', 'local VERSION = "9.9.9-cast-dev"', 1)
+    local f = io.open("pc_cast_dev_copy.lua", "w"); f:write(dev); f:close()
+    write_config('dev_cast_script_path = "pc_cast_dev_copy.lua"')
+    M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, x = 0, z = 0, idle = false, melee = true,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
+    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
+    setup_done()
+    M.advance(4)
+    local log = io.open("proactive_command_log.txt"):read("*a")
+    expect(log:find("9.9.9-cast-dev", 1, true), "the development copy of the casting script ran")
+    expect(#M.ai_events("ai_add", "karl") == 1, "and works")
+    """
+
+
+@scenario
+def cast_not_in_multiplayer():
+    """
+    M.multiplayer = true
+    M.local_army = 1
+    M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, x = 0, z = 0, idle = false, melee = true,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
+    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
+    setup_done()
+    M.advance(5)
+    expect(#M.ai_events("ai_add", "karl") == 0, "auto-cast stays out of multiplayer")
+    """
+
 
 def run(name, body, verbose):
     lua = lua51.LuaRuntime(unpack_returned_tuples=True)
@@ -709,10 +767,17 @@ def run(name, body, verbose):
     os.chdir(workdir)  # the mod writes its log relative to the working directory
     lua.execute('package.preload["pc_catalog"] = function() return dofile(%r) end' % CATALOG)
     lua.execute("dofile(%r)" % os.path.join(HERE, "mock_battle.lua"))
+    # The game's Lua sandbox lacks some standard pieces; make the mock match so the tests
+    # catch scripts that rely on them (math.huge was nil in the real game and crashed the
+    # first tick after contact; debug.traceback corrupted the game's script log clock).
+    lua.execute("math.huge = nil; if debug then debug.traceback = nil end")
     lua.execute("function dofile_mod() dofile(%r) end" % MOD)
+    lua.execute("function dofile_cast() dofile(%r) end" % CAST)
     lua.execute("CATALOG_PATH = %r" % CATALOG)
     lua.execute("MOD_PATH = %r" % MOD)
+    lua.execute("CAST_PATH = %r" % CAST)
     lua.execute(COMMON)
+    lua.execute("write_config()")
     try:
         lua.execute(body)
         status = "PASS"
