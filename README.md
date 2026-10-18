@@ -55,15 +55,14 @@ or right-click the zip, choose **Properties → Unblock**, and extract it again.
 
 ## Multiplayer (experimental)
 
-The idle-unit script runs in multiplayer battles (co-op and head-to-head), with one rule:
+Both scripts run in multiplayer battles (co-op and head-to-head), with one rule:
 **each player's copy only commands that player's own army**. Your friend's army and the enemy
-are never touched. **Auto-cast is single-player only for now** (`proactive_command_cast.lua` does
-nothing in multiplayer).
+are never touched. Auto-cast uses the same own-army snapshot as idle-unit handling.
 
 - Every player should have the same version of the pack enabled. A player who doesn't want the
   automation can keep it enabled and set `allow_in_multiplayer = false` in their own config file.
-- **Not yet tested in a real multiplayer battle.** If you get a desync, set
-  `allow_in_multiplayer = false` and share both players' `proactive_command_log.txt`.
+- **Experimental.** Idle movement and casting both use script AI planners; if you get a desync,
+  set `allow_in_multiplayer = false` and share both players' `proactive_command_log.txt`.
 - Avoid fast-forward in multiplayer battles with the mod active.
 
 ## Hotkeys (bind them once)

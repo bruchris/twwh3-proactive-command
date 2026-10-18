@@ -46,8 +46,8 @@ return {
         -- wh_main_spell_heavens_comet_of_casandora = true,   -- never trigger on this ability
     },
 
-    -- Multiplayer (experimental): idle-unit handling only ever commands your own army.
-    -- Auto-cast does not run in multiplayer.
+    -- Multiplayer (experimental): both scripts only ever command your own army.
+    -- Every player needs the same version. Set false if you hit a desync.
     allow_in_multiplayer = true,
 
     log_level = 1,                        -- 2 = also log why units were skipped

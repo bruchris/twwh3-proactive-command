@@ -45,7 +45,8 @@ Packed output: `dist/proactive_command.pack` → game `data/` folder. Thumbnail:
 - **Auto-cast:** the cast script reads ability states through `cco` on its own UI timer (`BattleAbilityList`, `CanCurrentlyPerform`, ...),
   decides on its own game-clock timer from `proactive_command.state.last_snap`, and uses the same planner calls. `watch_use` logs every
   ability that goes from ready to not-ready (`[cast] USED ...`, with whether the unit was with the AI) — this is how we find out if the
-  game AI really casts for held units. Not run in multiplayer.
+  game AI really casts for held units. Multiplayer uses the same own-army snapshot as the main script
+  (`allow_in_multiplayer`; experimental).
 - **Toggles:** `S.engage_on` (main) / `C.on` (cast) flipped by `hotkey_toggle_engage` / `hotkey_toggle_casting`; independent.
 - **Unit controllers take units away from the player** until `release_control()` (`schedule_release` / `release_due` in the main script).
 - **Diagnostics:** `chk(label)` logs `TRACE:` when `bm:time_elapsed_ms()` stops returning a number; `track_units` warns about

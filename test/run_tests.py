@@ -748,16 +748,55 @@ def cast_dev_mode_loose_copy():
 
 
 @scenario
-def cast_not_in_multiplayer():
+def cast_in_multiplayer_own_army_only():
     """
     M.multiplayer = true
+    local friend_army = M.add_army(player, { player = true, winds = 30, reserve = 0 })
     M.local_army = 1
+    M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, x = 0, z = 0, idle = false, melee = true,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
+    M.add_unit(friend_army, { name = "friends_karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, x = -40, z = 0, idle = false, melee = true,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
+    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
+    setup_done()
+    M.advance(4)
+    expect(#M.ai_events("ai_add", "karl") == 1, "auto-cast hands my own lord to the game AI in multiplayer")
+    expect(#M.ai_events("ai_add", "friends_karl") == 0, "never hands the other player's lord over")
+    local log = io.open("proactive_command_log.txt"):read("*a")
+    expect(log:find("multiplayer battle: auto-cast on", 1, true), "the log says multiplayer auto-cast is on")
+    """
+
+
+@scenario
+def cast_multiplayer_second_player():
+    """
+    M.multiplayer = true
+    local host_army = P
+    local my_army = M.add_army(player, { player = true, winds = 30, reserve = 0 })
+    M.local_army = 2
+    M.add_unit(host_army, { name = "host_karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, x = -40, z = 0, idle = false, melee = true,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
+    M.add_unit(my_army, { name = "my_karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, x = 0, z = 0, idle = false, melee = true,
+        abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
+    M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
+    setup_done()
+    M.advance(4)
+    expect(#M.ai_events("ai_add", "my_karl") == 1, "the second player's copy casts for its own lord")
+    expect(#M.ai_events("ai_add", "host_karl") == 0, "and leaves the host's lord alone")
+    """
+
+
+@scenario
+def cast_multiplayer_switched_off():
+    """
+    M.multiplayer = true
+    write_config("allow_in_multiplayer = false")
     M.add_unit(P, { name = "karl", type = "wh_main_emp_cha_karl_franz_0", men = 1, is_character = true, x = 0, z = 0, idle = false, melee = true,
         abilities = { { key = "wh_main_weapon_abilities_sword_of_anti_heroes", cd = 90, dur = 40 } } })
     M.add_unit(E, { name = "warriors", type = "wh3_main_kho_inf_chaos_warriors_0", x = 0, z = 5, melee = true })
     setup_done()
     M.advance(5)
-    expect(#M.ai_events("ai_add", "karl") == 0, "auto-cast stays out of multiplayer")
+    expect(#M.ai_events("ai_add", "karl") == 0, "auto-cast stays off when allow_in_multiplayer = false")
     """
 
 

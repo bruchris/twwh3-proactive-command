@@ -18,7 +18,7 @@
 -- Log lines go into proactive_command_log.txt through the main script, tagged [cast].
 --------------------------------------------------------------------------------
 
-local VERSION = "0.1.0"
+local VERSION = "0.1.1"
 
 if proactive_command_cast_loaded then return end
 
@@ -59,6 +59,8 @@ proactive_command_cast_loaded = true
 
 local DEFAULTS = {
     auto_cast = true,                 -- start each battle with auto-cast on (hotkey toggles it)
+    allow_in_multiplayer = true,      -- same setting as the idle-unit script: each player's copy
+                                      -- only acts on that player's own army (from the shared snapshot)
     cast_start_grace_seconds = 15,    -- no automatic casting for this long after the battle starts
     cast_hold_seconds = 8,            -- longest a unit stays with the game AI
     cast_release_after_cast = 2,      -- hand the unit back this long after it used an ability
@@ -526,7 +528,19 @@ end
 local function init()
     load_user_config()
     C.on = cfg.auto_cast ~= false
-    if try(bm.is_tutorial, bm) or try(bm.is_replay, bm) or try(bm.is_multiplayer, bm) then return end
+    if try(bm.is_tutorial, bm) or try(bm.is_replay, bm) then return end
+    if try(bm.is_multiplayer, bm) then
+        if not cfg.allow_in_multiplayer then
+            log(1, "multiplayer battle: auto-cast not running (allow_in_multiplayer = false)")
+            flush()
+            return
+        end
+        -- Own-army filtering is done by the idle-unit script's snapshot (S.last_snap.player_armies).
+        -- This script never looks at any other army, so co-op and head-to-head are safe as long as
+        -- every player runs the same version.
+        C.mp = true
+        log(1, "multiplayer battle: auto-cast on (only this player's own army, experimental)")
+    end
     C.catalog = load_catalog()
     if not C.catalog then
         log(0, "ERROR: could not load ability catalog; auto-cast is off")

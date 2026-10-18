@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.5.0-beta.2
+
+- **Auto-cast in multiplayer** (experimental), same rule as idle units: each player's copy only
+  acts on that player's own army. Uses the shared `allow_in_multiplayer` setting. Every player
+  still needs the same version. Watch for desyncs; set `allow_in_multiplayer = false` if you hit one.
+
 ## v0.5.0-beta.1
 
 Auto-cast is now its own script, and the game's own AI does the casting.
