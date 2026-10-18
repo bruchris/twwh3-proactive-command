@@ -111,7 +111,7 @@ Set `log_level = 2` to also see why units were skipped.
   script clock. If the log ever shows a `TRACE:` line, that names the step that broke it.
 - Army abilities (bombardments, faction powers) are left to you.
 - Settings are only in the config file. There is no Mod Configuration Tool menu yet.
-- Multiplayer support is experimental and untested in a live match (see above).
+- Multiplayer support is experimental: confirmed in one live co-op battle so far (see above).
 
 ## For developers
 

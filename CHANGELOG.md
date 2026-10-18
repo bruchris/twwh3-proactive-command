@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.5.0
+
+The first version confirmed working in a real battle. In a live co-op multiplayer battle the
+game's own AI cast 74 abilities and spells for the player's lords and heroes, idle units
+engaged 222 times, and there were no errors or timer stops.
+
+- **Idle units and casting are played by the game's own battle AI** (the AI unit planner that
+  enemy armies use): idle units, and casters with a ready ability, are handed to it for a short
+  while and then given back. Your orders always win: moving, aiming, guard mode and Off are
+  left alone. (Lillemats90, v0.5.0-beta.1 and beta.2)
+- **Auto-cast is its own script** with its own timers and hotkey, so a casting problem can never
+  stop idle units. New hotkeys: *Save camera bookmark 9* (auto-engage on/off) and
+  *Save camera bookmark 12* (auto-cast on/off).
+- **Multiplayer**: each player's copy only acts on that player's own army, for both idle units
+  and casting. Every player needs the same version.
+- **Fixes for the script environment**: no `math.huge` (it does not exist in the game) and no
+  `debug.traceback` (it corrupts the game's script clock); UI context objects are only used from
+  the UI side and the battle model only from the game-clock side.
+- Includes everything from v0.4.0-beta.1: unlimited reach after first contact, the one-click
+  installer improvements, live editing (`dev_script_path`, `dev_cast_script_path`).
+
 ## v0.5.0-beta.2
 
 - **Auto-cast in multiplayer** (experimental), same rule as idle units: each player's copy only

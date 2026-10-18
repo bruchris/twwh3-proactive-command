@@ -93,6 +93,9 @@ code at all; the cast script reads abilities on the UI side and only makes AI-pl
 model timer. If the log shows `TRACE: bm:time_elapsed_ms() stopped returning a number after step
 '...'`, that is the step to look at.
 
+v0.5.0 was confirmed in a live co-op battle: 74 casts by the game AI, 222 engagements, no
+errors and no timer stops.
+
 ## Regenerate the ability catalog (after a game patch, or for an overhaul)
 
 The catalog is read from the game's own packs, which are zstd-compressed, so this needs
