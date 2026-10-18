@@ -1,5 +1,80 @@
 # Changelog
 
+## v0.5.0-beta.2
+
+- **Auto-cast in multiplayer** (experimental), same rule as idle units: each player's copy only
+  acts on that player's own army. Uses the shared `allow_in_multiplayer` setting. Every player
+  still needs the same version. Watch for desyncs; set `allow_in_multiplayer = false` if you hit one.
+
+## v0.5.0-beta.1
+
+Auto-cast is now its own script, and the game's own AI does the casting.
+
+- **Two scripts.** `proactive_command.lua` handles idle units, `proactive_command_cast.lua`
+  handles spells and abilities. Each has its own timers, state and hotkey; an error or a stalled
+  timer in one cannot stop the other. They share only the battlefield snapshot, a registry of
+  which unit is with the AI (so they never fight over a unit) and the log.
+- **Idle units go through the game's AI** (`engage_mode = "ai"`, now the default): the engine's AI
+  unit planner plays the unit for `ai_hold_seconds`, then it is given back. Lords and heroes are
+  included. `engage_mode = "mod"` keeps the old own-scoring behaviour.
+- **Auto-cast hands casters to the same AI** when an ability is ready and an enemy is in reach,
+  and takes them back as soon as the unit has cast (or after `cast_hold_seconds`). The log shows
+  every ability use and whether the AI was in control.
+- **Removed from the main script:** all spell scoring (CA ability templates, `best_target`), the
+  Winds of Magic coordinator, UI/unit-controller casting, the debug bisect and canary code. These
+  settings no longer exist: `min_score`, `score_bias`, `reserve_*`, `mana_pressure`,
+  `min_seconds_between_spells`, `cast_targeted`, `allow_friendly_fire`, `friendly_fire_margin`,
+  `restore_orders`, `min_score_override`, `debug_bisect`, `debug_canary`.
+- New settings: `cast_start_grace_seconds`, `cast_hold_seconds`, `cast_release_after_cast`,
+  `cast_cooldown`, `cast_cooldown_no_cast`, `cast_enemy_range`, `cast_self_range`,
+  `cast_defend_radius`, `cast_max_holds`, `cast_while_moving`, `cast_watch`, `dev_cast_script_path`.
+- Auto-cast does not run in multiplayer.
+- The hotkey toggles behave as before (casting and engaging are independent).
+
+## v0.4.0-beta.3
+
+Reworked how the mod talks to the game, to stop the "mod goes quiet after a second or two"
+problem for good.
+
+- **No more HUD context objects for abilities.** Ability lists used to be read through `cco(...)`.
+  In real battles that corrupted the engine's script state a moment later (the game-clock timers
+  stopped and `battle:time_elapsed_ms()` returned a function). Abilities are now read with the
+  battle scripting API (`unit:owned_non_passive_special_abilities()`,
+  `unit:can_perform_special_ability()`) and used through the unit controller
+  (`perform_special_ability`), the same way CA's own battle scripts do it. The mock used by the
+  tests now refuses any ability read through `cco`.
+- **Units are handed back to the player.** A unit controller takes a unit away from the player
+  (its card is greyed out) until control is released. The mod now calls `release_control()` shortly
+  after each order or cast, so you can always command your units. `release_control = false` restores
+  the old behaviour.
+- **Player orders are never overridden.** Only units that are idle (no order at all, not moving, not
+  fighting, not in guard mode) get automatic targets. A unit must have been idle for `idle_delay`
+  seconds (default 5) first, or `idle_delay_under_attack` (1.5) if it is being shot at or charged.
+- **Start grace period:** no automatic orders for `start_grace_seconds` (default 15) after the battle
+  starts. Abilities and spells are not delayed.
+- **Every unit with abilities** can auto-cast, not only lords and heroes (`default_mode_units`
+  is now `"full"`). The Winds of Magic budget rules are unchanged.
+- **Hotkeys:** auto-cast on/off (`camera_bookmark_save11`, "bookmark 12") and auto-engage on/off
+  (`camera_bookmark_save8`, "bookmark 9"). The shortcut ids are settings in the config file
+  (`hotkey_toggle_casting`, `hotkey_toggle_engage`, ...). `auto_cast = false` starts a battle with
+  casting off.
+- **Trace log:** if the engine's clock ever breaks again, the log names the exact step
+  (`TRACE: bm:time_elapsed_ms() stopped returning a number after step '...'`). The log also warns
+  if a unit is still script-controlled after being handed back, or lost its order.
+- The UI timer is now only a watchdog (no ability reading, no game queries); the counting "canary"
+  timers are off unless `debug_canary` or `debug_bisect` is set.
+
+## v0.4.0-beta.2
+
+- **Fixed the crash that stopped the mod right after the first contact.** The engagement code
+  used `math.huge` for "unlimited reach", but that value does not exist (it is `nil`) in the
+  game's Lua environment, so the first tick after the fighting started failed with
+  `attempt to compare nil with number` and the mod went quiet. It now uses a large number.
+- The error handler no longer calls `debug.traceback()`, which in the game corrupted the
+  script log's clock and added nothing useful.
+- Offline tests now run with `math.huge` and `debug.traceback` removed, like the real game,
+  so this kind of mistake is caught before a release.
+
 ## v0.4.0-beta.1
 
 Beta for testing. **Known issue:** in real battles the mod still stops after its first second

@@ -40,6 +40,8 @@ DIST = os.path.join(ROOT, "dist")
 SHORTCUT_NAMES = {
     "shortcut_localisation_onscreen_camera_bookmark_save9": "Save camera bookmark 10 / Proactive: cycle mode of selected units",
     "shortcut_localisation_onscreen_camera_bookmark_save10": "Save camera bookmark 11 / Proactive: pause or resume",
+    "shortcut_localisation_onscreen_camera_bookmark_save11": "Save camera bookmark 12 / Proactive: auto-cast on or off",
+    "shortcut_localisation_onscreen_camera_bookmark_save8": "Save camera bookmark 9 / Proactive: auto-engage on or off",
 }
 
 # what goes into the shareable zip: (path in repo, name in zip, windows line endings?)

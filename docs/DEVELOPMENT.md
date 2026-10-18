@@ -78,23 +78,20 @@ the ability catalog, and the hand-over code at the top of the script itself.
    `...\Total War WARHAMMER III\data\script\`. Every session then writes a
    `script_log_DDMMYY_HHMM.txt` in the game folder with all script output and script errors,
    each line prefixed with real time and game time. Delete the file to switch it off.
-3. **`debug_bisect`** in `proactive_command_config.lua`: `true` (or a step number to start at)
-   makes the mod run one kind of game call per second at battle start, logging each step
-   before and after, followed by normal ticks. Two "canary" timers that only count, and a
-   status line every 2 seconds written from the UI side, show whether the game's timers are
-   still firing.
+3. **Cast script lines** are tagged `[cast]` in the mod log (`CAST HOLD`, `USED`, `RELEASE`). `USED ... (while with
+   the game AI: cast)` shows that the game AI really cast for a held unit.
+4. **Live edit:** set `dev_script_path` and `dev_cast_script_path` in the user config to the checkout's script
+   files; each battle then runs the loose copies. (The pack must contain both scripts once.)
 
-### Open issue (v0.4.0-beta.1)
+### Known engine problem (v0.4.0 betas)
 
-In real battles, right after the mod's first *normal* tick, the game stops **all** game-clock
-script timers, including the trivial canaries; UI-side timers keep running and the game itself
-continues. With `debug_bisect`, all 33 read-only query kinds (steps 1-33, including a full
-snapshot of 24 units) ran for 34 seconds without a problem. The first normal tick after that
-stopped everything, without casting or ordering anything. That tick still called
-`army:unique_id()` and `unit:is_ai_controlled()`; both are now gone from normal ticks and are
-diagnosis steps 34 and 35, followed by `ordered_position/bearing/width` (36), creating a unit
-controller (37), ability decisions (38) and engagement planning (39). The next test with
-`debug_bisect = 33` should show which step stops the timers, or that the mod now works.
+Running ability scoring / reading code on the **model tick** of the main script made
+`bm:time_elapsed_ms()` return a function and stopped both game-clock timers for the rest of the
+battle (UI timers kept running). The cause was never pinned down (not the garbage collector, not
+the `owned_*` / `can_perform_*` calls alone). Since v0.5.0 the main script contains no ability
+code at all; the cast script reads abilities on the UI side and only makes AI-planner calls on its
+model timer. If the log shows `TRACE: bm:time_elapsed_ms() stopped returning a number after step
+'...'`, that is the step to look at.
 
 ## Regenerate the ability catalog (after a game patch, or for an overhaul)
 
